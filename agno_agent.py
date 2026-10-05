@@ -63,6 +63,7 @@ Run:
 
 import ast
 import asyncio
+import base64
 import json
 import operator
 import os
@@ -83,6 +84,11 @@ from agno.session.summary import SessionSummaryManager
 from agno.tools import tool
 from agno.tools.user_control_flow import UserControlFlowTools
 from agno.tools.user_feedback import UserFeedbackTools
+from openinference.instrumentation.agno import AgnoInstrumentor
+from opentelemetry import trace as trace_api
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 
 from doc_tools import DOCS_ROOT, DOCUMENT_TOOLS  # STEP 4
 from tool_guard import AUDIT_LOG, remember_tool_activity, tool_guard  # STEP 5
@@ -92,6 +98,25 @@ from spotlight import nonce_for, rules as untrusted_rules  # STEP 6
 from grounding import GROUNDING_MODE, correction_prompt, grounding_hook, pop_report  # STEP 7
 
 dotenv.load_dotenv()
+
+# ---------------------------------------------------------------------------
+# Langfuse tracing (OpenTelemetry): agent runs, model calls, tool calls and the
+# background memory / session-summary LLM calls show up as traces in Langfuse.
+# ---------------------------------------------------------------------------
+_auth = base64.b64encode(
+    f"{os.environ['LANGFUSE_PUBLIC_KEY']}:{os.environ['LANGFUSE_SECRET_KEY']}".encode()
+).decode()
+_provider = TracerProvider()
+_provider.add_span_processor(
+    SimpleSpanProcessor(
+        OTLPSpanExporter(
+            endpoint=f"{os.environ['LANGFUSE_BASE_URL']}/api/public/otel/v1/traces",
+            headers={"Authorization": f"Basic {_auth}"},
+        )
+    )
+)
+trace_api.set_tracer_provider(_provider)
+AgnoInstrumentor().instrument()
 
 # ---------------------------------------------------------------------------
 # Model: the user picks one (Mike lets each user choose). Swap via MODEL env.
@@ -573,3 +598,4 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+    _provider.force_flush()

@@ -1,0 +1,547 @@
+From 06e41a6b40e8c8e8d591478b686af77894d9fbb3 Mon Sep 17 00:00:00 2001
+From: ahmedalbahnasawy92 <ahmed.albahnasawy@saal.ai>
+Date: Mon, 5 Oct 2026 19:51:44 +0400
+Subject: [PATCH] Step 7: grounding check for document answers
+
+- grounding.py: verify names, numbers, quotes and citations in each answer
+  against this turn's tool results, with Arabic-aware normalisation
+- Post-hook records a report; CLI warns and runs one automatic correction
+  (GROUNDING_MODE=retry|warn|off); results written to audit.log
+- Prompt: prefer targeted find_in_document; answers are checked
+- tests/test_step7.py covering invented Arabic names, quotes, numbers,
+  citations and non-document answers
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Pr6CTTM5Nqv9ihGiKHnj2d
+---
+ .env.example        |   1 +
+ README.md           |   4 +-
+ agno_agent.py       |  47 +++++++--
+ grounding.py        | 229 ++++++++++++++++++++++++++++++++++++++++++++
+ tests/test_step7.py | 121 +++++++++++++++++++++++
+ 5 files changed, 395 insertions(+), 7 deletions(-)
+ create mode 100644 grounding.py
+ create mode 100644 tests/test_step7.py
+
+diff --git a/.env.example b/.env.example
+index 7ed35ca..4e01b70 100644
+--- a/.env.example
++++ b/.env.example
+@@ -12,4 +12,5 @@ USER_ID=demo-user
+ # DOCS_ROOT=docs
+ # MAX_READ_CHARS=100000
+ # MAX_TOOL_RESULT_CHARS=120000
++# GROUNDING_MODE=retry   # retry | warn | off
+ # SPOTLIGHT_SECRET=   # otherwise generated once into .spotlight_secret
+diff --git a/README.md b/README.md
+index 2569495..e93f176 100644
+--- a/README.md
++++ b/README.md
+@@ -17,6 +17,7 @@ keeps it grounded, safe and cheap.
+ | 4 | Document tools: `list_documents`, `read_document`, `find_in_document`; per-user folders; page markers; capped reads; text cache | `doc_tools.py` |
+ | 5 | Tool guard: read-once per run, error safety net, output cap, audit log, previous-turn tool activity | `tool_guard.py` |
+ | 6 | Document list in the system prompt; untrusted text fenced with a per-chat code (prompt-injection defence) | `spotlight.py`, `doc_tools.py` |
++| 7 | Grounding check: names, numbers, quotes and citations in each answer verified against this turn's tool results (Arabic-aware); one automatic correction if something isn't found | `grounding.py` |
+ | – | Reply language decided in code: Arabic or English, other languages refused | `language.py` |
+ 
+ ## Quick start
+@@ -36,6 +37,7 @@ Chat commands: `/docs` `/memories` `/summary` `/activity` `/audit` `/new`
+ ```bash
+ python tests/test_step5.py
+ python tests/test_step6.py
++python tests/test_step7.py
+ ```
+ 
+ ## Layout
+@@ -45,6 +47,7 @@ agno_agent.py     agent, prompts, streaming CLI, human-in-the-loop handling
+ doc_tools.py      document tools + text extraction + AVAILABLE DOCUMENTS block
+ tool_guard.py     tool_hooks guard + post-hook tool-activity note
+ spotlight.py      untrusted-text fencing (nonce per chat)
++grounding.py      answer-vs-evidence check (step 7)
+ language.py       reply-language detection
+ tests/            offline tests
+ examples/         router_agno.py (router + specialists example)
+@@ -53,7 +56,6 @@ docs/<user_id>/   each user's documents (not committed)
+ 
+ ## Roadmap
+ 
+-- Step 7: grounding check — verify names and quotes in answers against this turn's tool results
+ - Step 8: semantic search (Knowledge + pgvector) for large documents
+ - Step 9: API server (AgentOS / FastAPI) + Postgres
+ - Step 10: document editing with versions, DOCX/XLSX generation, tabular review
+diff --git a/agno_agent.py b/agno_agent.py
+index ea24c51..ce8207f 100644
+--- a/agno_agent.py
++++ b/agno_agent.py
+@@ -46,6 +46,12 @@ STEP 6: context engineering + prompt-injection defence (spotlight.py).
+       search snippets, file names, user answers
+   [x] Instructions are built per run (instructions=build_instructions)
+ 
++STEP 7: grounding check (grounding.py).
++  [x] After each run, names / numbers / quotes / citations in the answer are
++      checked against THIS turn's tool results (Arabic-aware matching)
++  [x] Unverified -> one automatic correction run (GROUNDING_MODE=retry),
++      or just a warning (warn), or off
++
+ Setup:
+   pip install agno openai httpx python-dotenv sqlalchemy pymupdf python-docx openpyxl
+   Put files in docs/<user_id>/  (default user: docs/demo-user/)
+@@ -83,6 +89,7 @@ from tool_guard import AUDIT_LOG, remember_tool_activity, tool_guard  # STEP 5
+ from language import REFUSAL, detect_language, language_instruction  # language rule
+ from doc_tools import documents_block  # STEP 6
+ from spotlight import nonce_for, rules as untrusted_rules  # STEP 6
++from grounding import GROUNDING_MODE, correction_prompt, grounding_hook, pop_report  # STEP 7
+ 
+ dotenv.load_dotenv()
+ 
+@@ -295,6 +302,11 @@ Documents (STEP 4 + 6):
+ - Answer only from what the tools returned. Quote exact wording in "quotes"
+   and cite the page, e.g. (doc-1a2b3c, Page 4). If it isn't in the document, say so.
+ - If a read is truncated, use find_in_document for the rest; don't guess.
++- For a question about one decision, clause, person or number, prefer
++  find_in_document with a precise phrase (and a larger context_chars) over
++  reading the whole document: less text, fewer mix-ups.
++- Every name, number and quote in your answer is automatically checked against
++  THIS turn's tool results. Copy them exactly; never add names from memory.
+ 
+ Previous turn (STEP 5):
+ - session_state.previous_turn_tool_activity lists what tools did in the previous
+@@ -337,7 +349,7 @@ agent = Agent(
+ 
+     # STEP 5: guard around every tool call + tool-activity note after each run
+     tool_hooks=[tool_guard],
+-    post_hooks=[remember_tool_activity],
++    post_hooks=[remember_tool_activity, grounding_hook],  # STEP 7: grounding check
+     session_state={"previous_turn_tool_activity": []},
+     add_session_state_to_context=True,
+ 
+@@ -378,6 +390,27 @@ async def chat_turn(text: str, user_id: str, session_id: str) -> None:
+     _last_language[session_id] = lang
+     deps = {"reply_language": language_instruction(lang)}
+ 
++    run_id = await run_once(text, user_id, session_id, deps)
++
++    # STEP 7: grounding check (computed by grounding_hook after the run)
++    report = pop_report(run_id)
++    if report is None or not report.checked:
++        return
++    if report.ok:
++        print(f"  [grounding] OK: {report.summary()}")
++        return
++    print(f"  [grounding] WARNING: {report.summary()}")
++    if GROUNDING_MODE == "retry":  # ONE automatic correction, then stop
++        print("  [grounding] asking the model to correct its answer...\nAI: ", end="")
++        retry_id = await run_once(correction_prompt(report), user_id, session_id, deps)
++        second = pop_report(retry_id)
++        if second is not None and second.checked:
++            label = "OK" if second.ok else "STILL UNVERIFIED (check the sources)"
++            print(f"  [grounding] after correction: {label}: {second.summary()}")
++
++
++async def run_once(text: str, user_id: str, session_id: str, deps: dict):
++    """One run, including any pauses. Returns the run_id."""
+     stream = agent.arun(
+         text,
+         user_id=user_id,
+@@ -389,7 +422,7 @@ async def chat_turn(text: str, user_id: str, session_id: str) -> None:
+     )
+     # STEP 3: one turn may pause several times (ask -> approve -> ...).
+     # Each pause: collect the answers, then continue the SAME run.
+-    paused = await render_stream(stream)
++    paused, run_id = await render_stream(stream)
+     while paused is not None:
+         resolve_requirements(paused.requirements or [])
+         print("AI: ", end="")
+@@ -402,13 +435,15 @@ async def chat_turn(text: str, user_id: str, session_id: str) -> None:
+             stream=True,
+             stream_events=True,
+         )
+-        paused = await render_stream(stream)
++        paused, run_id = await render_stream(stream)
++    return run_id
+ 
+ 
+ async def render_stream(stream):
+-    """Print one stream. Returns the RunPaused event if the run paused, else None."""
+-    paused = None
++    """Print one stream. Returns (RunPaused event or None, run_id)."""
++    paused, run_id = None, None
+     async for ev in stream:
++        run_id = getattr(ev, "run_id", None) or run_id
+         if ev.event == RunEvent.run_paused:                       # STEP 3
+             paused = ev
+         elif ev.event == RunEvent.run_content and ev.content:
+@@ -424,7 +459,7 @@ async def render_stream(stream):
+         elif ev.event == RunEvent.run_error:
+             print(f"\n  [error] {ev.content}")
+     print()
+-    return paused
++    return paused, run_id
+ 
+ 
+ # ---------------------------------------------------------------------------
+diff --git a/grounding.py b/grounding.py
+new file mode 100644
+index 0000000..4351f8e
+--- /dev/null
++++ b/grounding.py
+@@ -0,0 +1,229 @@
++"""
++grounding.py: STEP 7, check the answer against THIS turn's tool results
++(Mike's verifyCitations, extended for names, numbers and Arabic).
++
++After every run, a post-hook extracts checkable claims from the answer:
++
++  quote     text in "...", “...”, «...», „...“         must appear in the evidence
++  citation  (doc-1a2b3c, Page 4)                      doc must be read/searched this turn
++  name      after a title (السيد، الدكتور، Mr., Dr.)   must appear in the evidence
++            or an Arabic 3-4 word name ("خالد سالم الحمادي")
++  number    2+ digits (45, 50,000, ٢٠٢٦)              must appear in evidence or question
++
++Evidence = results of read_document / find_in_document (and small tools like
++calculate) from THIS run only. Memory, summary and earlier turns don't count.
++
++Matching is Arabic-aware: diacritics and tatweel removed, أ/إ/آ->ا, ى->ي,
++ة->ه, Arabic-Indic digits -> 0-9, punctuation and extra spaces ignored.
++
++If something can't be verified, agno_agent.py either warns the user or
++re-asks the model once to correct itself (GROUNDING_MODE=retry|warn|off).
++
++Limits (it's a safety net, not proof): paraphrases are not checked, and the
++Arabic-name pattern is a heuristic. It catches invented names, numbers and
++quotes, which are the most harmful hallucinations in document answers.
++"""
++
++import os
++import re
++import unicodedata
++from dataclasses import dataclass, field
++from typing import Dict, List, Optional
++
++GROUNDING_MODE = os.getenv("GROUNDING_MODE", "retry")  # retry | warn | off
++DOC_TOOLS = {"read_document", "find_in_document"}
++EVIDENCE_TOOLS = DOC_TOOLS | {"calculate", "get_current_time", "get_weather", "list_documents"}
++
++# ---------------------------------------------------------------------------
++# Normalisation
++# ---------------------------------------------------------------------------
++_DIACRITICS = re.compile(r"[ؐ-ًؚ-ٰٟۖ-ۭـ]")  # + tatweel
++_ARABIC_MAP = str.maketrans({
++    "أ": "ا", "إ": "ا", "آ": "ا", "ٱ": "ا", "ى": "ي", "ة": "ه", "ؤ": "و", "ئ": "ي",
++    **{chr(0x0660 + i): str(i) for i in range(10)},   # ٠-٩
++    **{chr(0x06F0 + i): str(i) for i in range(10)},   # ۰-۹
++})
++_MARKERS = re.compile(r"<<\s*(UNTRUSTED|END)\b[^>]*>>|\[(Page|Sheet) [^\]]*\]|\[Document\]")
++
++
++def normalize(text: str) -> str:
++    t = unicodedata.normalize("NFKC", str(text))
++    t = _DIACRITICS.sub("", t).translate(_ARABIC_MAP).lower()
++    t = re.sub(r"(?<=\d)[,٬](?=\d{3})", "", t)        # 50,000 -> 50000
++    t = re.sub(r"[^\w\s]", " ", t)                     # punctuation -> space
++    return " ".join(t.split())
++
++
++def _found(claim: str, evidence_norm: str) -> bool:
++    c = normalize(claim)
++    return bool(c) and c in evidence_norm
++
++
++# ---------------------------------------------------------------------------
++# Claim extraction
++# ---------------------------------------------------------------------------
++_QUOTE_RE = re.compile(r'"([^"\n]{8,400})"|“([^”\n]{8,400})”|«([^»\n]{8,400})»|„([^“\n]{8,400})“')
++_CITATION_RE = re.compile(r"\b(doc-[0-9a-f]{6})\b")
++_PAGE_REF_RE = re.compile(r"\b(?:Page|Sheet|p\.)\s*[0-9٠-٩]+|(?:صفحة|الصفحة|ص)\s*[0-9٠-٩]+", re.IGNORECASE)
++_NUMBER_RE = re.compile(r"(?<![\w.])([0-9٠-٩۰-۹]{1,3}(?:[,٬][0-9٠-٩۰-۹]{3})+|[0-9٠-٩۰-۹]{2,})(?![\w])")
++_AR = r"[ء-ي٠-٩ـً-ْ]"
++_AR_WORD = rf"{_AR}{{2,}}"
++_TITLES_AR = r"(?:السيد[ةه]?|الدكتور[ةه]?|د\.|المهندس[ةه]?|الشيخ[ةه]?|الأستاذ[ةه]?|معالي|سعادة)"
++_TITLE_NAME_AR = re.compile(rf"{_TITLES_AR}\s*/?\s*((?:{_AR_WORD}\s+){{1,4}}{_AR_WORD})")
++_TITLE_NAME_EN = re.compile(r"\b(?:Mr|Mrs|Ms|Dr|Eng|Sheikh|H\.E)\.?\s+((?:[A-Z][a-z'-]+\s+){0,3}[A-Z][a-z'-]+)")
++# Arabic personal name: 2-3 given/father names (not starting with ال; "عبد الله"
++# counts as one), then a family name starting with ال: "خالد سالم الحمادي"
++_AR_GIVEN = rf"(?:عبد\s*ال{_AR}{{2,}}|(?!ال){_AR_WORD})"
++_AR_NAME = re.compile(rf"(?<!{_AR})((?:{_AR_GIVEN}\s+){{2,3}}ال{_AR}{{2,}})(?!{_AR})")
++_NOT_NAME_START = {normalize(w) for w in (
++    "في من على الى إلى عن مع هذا هذه ذلك تلك تم قرار مجلس لجنة وزارة رقم المادة بشأن "
++    "رئيس عضو نائب مدير هيئة دائرة اعتماد تشكيل تعيين اصدار إصدار نص يتم كان كانت قانون "
++    "مرسوم بند فقرة سنة عام شهر يوم حكومة دولة امارة إمارة ورد وردت يوجد لا لم لن ما "
++    "اعضاء أعضاء عضوية برئاسة يعين يعيّن تعين السادة"
++).split()}
++
++
++@dataclass
++class Claim:
++    kind: str     # quote | citation | name | number
++    text: str
++    ok: bool
++
++
++@dataclass
++class GroundingReport:
++    checked: bool = False          # False = not a document answer, nothing to check
++    no_evidence: bool = False      # cites/quotes documents but no document tool ran
++    claims: List[Claim] = field(default_factory=list)
++
++    @property
++    def unverified(self) -> List[Claim]:
++        return [c for c in self.claims if not c.ok]
++
++    @property
++    def ok(self) -> bool:
++        return not self.no_evidence and not self.unverified
++
++    def summary(self) -> str:
++        if not self.checked:
++            return "not a document answer, skipped"
++        if self.no_evidence:
++            return "cites documents but none were read this turn"
++        n = len(self.claims)
++        bad = self.unverified
++        if not bad:
++            return f"{n} claim(s) checked, all found in the documents"
++        items = "; ".join(f"{c.kind}: {c.text[:60]}" for c in bad[:8])
++        return f"{len(bad)} of {n} claim(s) NOT found in the documents: {items}"
++
++
++def _names(answer: str) -> List[str]:
++    out = [m.group(1) for m in _TITLE_NAME_AR.finditer(answer)]
++    out += [m.group(1) for m in _TITLE_NAME_EN.finditer(answer)]
++    for m in _AR_NAME.finditer(answer):
++        words = m.group(1).split()
++        first = normalize(words[0])
++        if first[:1] in ("و", "ف") and len(first) > 3:  # "ورئيس" -> "رئيس"
++            first = first[1:]
++        if first not in _NOT_NAME_START:
++            out.append(m.group(1))
++    seen, uniq = set(), []
++    for n in out:
++        k = normalize(n)
++        if k and k not in seen:
++            seen.add(k)
++            uniq.append(n.strip())
++    return uniq
++
++
++def check_grounding(answer: str, tools: list, user_text: str = "") -> GroundingReport:
++    """tools = run_output.tools (ToolExecution list) of THIS run."""
++    report = GroundingReport()
++    answer = answer or ""
++    doc_calls = [t for t in tools or [] if t.tool_name in DOC_TOOLS]
++    cites = set(_CITATION_RE.findall(answer))
++
++    if not doc_calls:
++        if cites:  # talks about documents without reading any
++            report.checked, report.no_evidence = True, True
++        return report
++    report.checked = True
++
++    evidence_raw = "\n".join(
++        _MARKERS.sub(" ", str(t.result)) for t in tools if t.tool_name in EVIDENCE_TOOLS and t.result)
++    evidence = normalize(evidence_raw)
++    allowed_numbers = evidence + " " + normalize(user_text)
++    used_docs = {str((t.tool_args or {}).get("doc_id", "")) for t in doc_calls}
++    used_docs |= set(_CITATION_RE.findall(evidence_raw))  # handles shown in results
++
++    # 1. quotes (parts split on ... are checked separately)
++    for m in _QUOTE_RE.finditer(answer):
++        q = next(g for g in m.groups() if g)
++        parts = [p for p in re.split(r"\.\.\.|…", q) if len(normalize(p)) >= 4]
++        report.claims.append(Claim("quote", q, all(_found(p, evidence) for p in parts)))
++
++    # 2. citations: the cited doc must have been read/searched this turn
++    for doc_id in sorted(cites):
++        report.claims.append(Claim("citation", doc_id, doc_id in used_docs))
++
++    # 3. names (also accept the name without a leading و/ف or extra first word)
++    for name in _names(answer):
++        words = name.split()
++        variants = [name, re.sub(r"^[وف]", "", name)]
++        if len(words) >= 4:
++            variants.append(" ".join(words[1:]))
++        report.claims.append(Claim("name", name, any(_found(v, evidence) for v in variants)))
++
++    # 4. numbers (2+ digits), ignoring those inside citations like doc-3e47c5
++    answer_wo_cites = _PAGE_REF_RE.sub(" ", _CITATION_RE.sub(" ", answer))
++    seen = set()
++    for m in _NUMBER_RE.finditer(answer_wo_cites):
++        num = normalize(m.group(1))
++        if num in seen:
++            continue
++        seen.add(num)
++        report.claims.append(Claim("number", m.group(1), bool(re.search(rf"(?<!\d){num}(?!\d)", allowed_numbers))))
++
++    return report
++
++
++def correction_prompt(report: GroundingReport) -> str:
++    """Message sent to the model for ONE automatic correction attempt."""
++    if report.no_evidence:
++        problem = "You cited documents without reading them in this turn."
++    else:
++        items = "\n".join(f"- {c.kind}: {c.text}" for c in report.unverified[:15])
++        problem = f"These items in your answer were NOT found in the tool results of this turn:\n{items}"
++    return (
++        "[Automatic grounding check, not written by the user]\n"
++        f"{problem}\n"
++        "Read or search the relevant document again now, then give a corrected answer. "
++        "Keep only names, numbers and quotes that appear in the tool results, copied exactly. "
++        "If something is not in the document, say it was not found. Do not apologise at length."
++    )
++
++
++# ---------------------------------------------------------------------------
++# Agno post-hook: run the check after every run and keep the report
++# ---------------------------------------------------------------------------
++_reports: Dict[str, GroundingReport] = {}   # run_id -> report (read by the CLI/API)
++
++
++def grounding_hook(run_output, run_context) -> None:
++    if GROUNDING_MODE == "off":
++        return
++    user_text = ""
++    if getattr(run_output, "input", None) is not None:
++        user_text = str(getattr(run_output.input, "input_content", "") or "")
++    report = check_grounding(str(run_output.content or ""), run_output.tools or [], user_text)
++    _reports[run_output.run_id] = report
++    try:  # also record it in the audit log
++        from tool_guard import _audit
++        _audit(run_context, tool="grounding_check", ok=report.ok,
++               result=report.summary()[:500])
++    except Exception:
++        pass
++
++
++def pop_report(run_id: Optional[str]) -> Optional[GroundingReport]:
++    return _reports.pop(run_id, None) if run_id else None
+diff --git a/tests/test_step7.py b/tests/test_step7.py
+new file mode 100644
+index 0000000..4c6d163
+--- /dev/null
++++ b/tests/test_step7.py
+@@ -0,0 +1,121 @@
++"""
++test_step7.py: offline tests for grounding.py (no LLM, no API key).
++
++Run:  python tests/test_step7.py      (or: pytest tests/test_step7.py)
++"""
++
++import sys
++from dataclasses import dataclass, field
++from pathlib import Path
++from typing import Any
++
++sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # repo root
++
++from grounding import check_grounding, correction_prompt, normalize  # noqa: E402
++
++N = "abcd1234"
++GAZETTE = (
++    f"Document doc-3e47c5: <<UNTRUSTED {N}>>2026_790.pdf<<END {N}>> (12 section(s))\n\n"
++    f'<<UNTRUSTED {N} source="doc-3e47c5">>\n[Page 4]\n'
++    "قرار رقم (45) لسنة 2026 بشأن تعيين رئيس لجنة التظلمات المركزية\n"
++    "يُعيّن السيد/ خلفان أحمد حارب رئيساً للجنة التظلمات المركزية.\n"
++    "[Page 5]\nقرار رقم (46) بتشكيل لجنة البت في التظلمات برئاسة "
++    "الدكتورة/ فاطمة علي الكعبي وعضوية سالم راشد المزروعي.\n"
++    "The Termination Fee is AED 50,000 and payment is due in 30 days.\n"
++    f"<<END {N}>>"
++)
++
++
++@dataclass
++class T:  # shaped like agno ToolExecution
++    tool_name: str
++    tool_args: dict = field(default_factory=dict)
++    result: Any = None
++
++
++READ = [T("read_document", {"doc_id": "doc-3e47c5"}, GAZETTE)]
++
++
++def test_1_your_case_invented_names_are_caught():
++    answer = ("أعضاء اللجنة: خالد سالم الحمادي، محمد خماس المانعي، عبد الله خميس الحبشي. "
++              "ورئيس لجنة التظلمات المركزية هو السيد/ خلفان أحمد حارب (doc-3e47c5, Page 4).")
++    r = check_grounding(answer, READ)
++    bad = {c.text for c in r.unverified}
++    assert bad == {"خالد سالم الحمادي", "محمد خماس المانعي", "عبد الله خميس الحبشي"}, bad
++    print("1. invented Arabic names flagged, real name passes      OK")
++    print("   ->", r.summary())
++
++
++def test_2_real_names_pass_with_spelling_variants():
++    # diacritics, different alef/taa marbuta forms, title with slash
++    answer = "برئاسة الدكتوره/ فاطمه علي الكعبي وعضوية سالِم راشد المزروعي."
++    r = check_grounding(answer, READ)
++    assert r.ok, r.summary()
++    print("2. real names pass despite ه/ة, diacritics, titles       OK")
++
++
++def test_3_quotes():
++    good = 'The contract says "The Termination Fee is AED 50,000" (doc-3e47c5, Page 5).'
++    bad = 'The contract says "The Termination Fee is waived after one year".'
++    assert check_grounding(good, READ).ok
++    r = check_grounding(bad, READ)
++    assert [c.kind for c in r.unverified] == ["quote"], r.summary()
++    print("3. exact quote passes, invented quote flagged            OK")
++
++
++def test_4_quote_with_ellipsis():
++    answer = '«يُعيّن السيد/ خلفان أحمد حارب ... للجنة التظلمات المركزية»'
++    assert check_grounding(answer, READ).ok
++    print("4. quote with ... checked part by part                   OK")
++
++
++def test_5_numbers_including_arabic_digits():
++    ok = check_grounding("القرار رقم (٤٦) والرسوم 50,000 درهم خلال 30 يوماً.", READ)
++    assert ok.ok, ok.summary()
++    bad = check_grounding("The fee is AED 75,000.", READ)
++    assert [c.text for c in bad.unverified] == ["75,000"], bad.summary()
++    print("5. numbers checked (٤٦ = 46, 50,000), invented one flagged OK")
++
++
++def test_6_page_numbers_are_not_claims():
++    r = check_grounding("See (doc-3e47c5, Page 12) and الصفحة 15.", READ)
++    assert r.ok, r.summary()
++    print("6. page numbers in citations are not flagged             OK")
++
++
++def test_7_citation_to_unread_document():
++    r = check_grounding("As stated in doc-ffffff, the fee is 50,000.", READ)
++    assert [c.text for c in r.unverified] == ["doc-ffffff"], r.summary()
++    print("7. citing a document NOT read this turn is flagged       OK")
++
++
++def test_8_cites_documents_without_reading():
++    r = check_grounding("According to doc-3e47c5 the fee is AED 50,000.", tools=[])
++    assert r.no_evidence and not r.ok
++    assert "without reading" in correction_prompt(r)
++    print("8. document answer with no read this turn is flagged     OK")
++
++
++def test_9_non_document_answer_is_skipped():
++    r = check_grounding("Dubai is 31°C today.", [T("get_weather", {"city": "Dubai"}, "Dubai: 31°C")])
++    assert not r.checked and r.ok
++    print("9. weather/chit-chat answers are not checked             OK")
++
++
++def test_10_numbers_from_user_question_are_allowed():
++    r = check_grounding("Decision 99 is not in the document.", READ, user_text="what does decision 99 say?")
++    assert r.ok, r.summary()
++    print("10. numbers the user asked about are allowed             OK")
++
++
++def test_11_normalize():
++    assert normalize("إِلَى الْمَدِينَةِ") == normalize("الى المدينه")
++    assert normalize("٢٠٢٦") == "2026" and normalize("50,000") == "50000"
++    print("11. Arabic normalisation (diacritics, alef, digits)      OK")
++
++
++if __name__ == "__main__":
++    for name, fn in sorted(globals().items(), key=lambda kv: int(kv[0].split("_")[1]) if kv[0].startswith("test_") else 0):
++        if name.startswith("test_"):
++            fn()
++    print("\nAll step-7 tests passed.")
+-- 
+2.43.0
+
