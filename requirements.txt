@@ -1,0 +1,10 @@
+agno>=3.1
+openai
+httpx
+python-dotenv
+sqlalchemy
+pymupdf
+python-docx
+openpyxl
+# optional: better English vs other-Latin-language detection (~100 MB)
+# lingua-language-detector

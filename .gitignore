@@ -1,0 +1,13 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+agent.db
+audit.log
+.doc_cache/
+.spotlight_secret
+notes/
+docs/*
+!docs/demo-user/
+docs/demo-user/*
+!docs/demo-user/.gitkeep
