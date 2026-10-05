@@ -46,6 +46,12 @@ STEP 6: context engineering + prompt-injection defence (spotlight.py).
       search snippets, file names, user answers
   [x] Instructions are built per run (instructions=build_instructions)
 
+STEP 7: grounding check (grounding.py).
+  [x] After each run, names / numbers / quotes / citations in the answer are
+      checked against THIS turn's tool results (Arabic-aware matching)
+  [x] Unverified -> one automatic correction run (GROUNDING_MODE=retry),
+      or just a warning (warn), or off
+
 Setup:
   pip install agno openai httpx python-dotenv sqlalchemy pymupdf python-docx openpyxl
   Put files in docs/<user_id>/  (default user: docs/demo-user/)
@@ -83,6 +89,7 @@ from tool_guard import AUDIT_LOG, remember_tool_activity, tool_guard  # STEP 5
 from language import REFUSAL, detect_language, language_instruction  # language rule
 from doc_tools import documents_block  # STEP 6
 from spotlight import nonce_for, rules as untrusted_rules  # STEP 6
+from grounding import GROUNDING_MODE, correction_prompt, grounding_hook, pop_report  # STEP 7
 
 dotenv.load_dotenv()
 
@@ -295,6 +302,11 @@ Documents (STEP 4 + 6):
 - Answer only from what the tools returned. Quote exact wording in "quotes"
   and cite the page, e.g. (doc-1a2b3c, Page 4). If it isn't in the document, say so.
 - If a read is truncated, use find_in_document for the rest; don't guess.
+- For a question about one decision, clause, person or number, prefer
+  find_in_document with a precise phrase (and a larger context_chars) over
+  reading the whole document: less text, fewer mix-ups.
+- Every name, number and quote in your answer is automatically checked against
+  THIS turn's tool results. Copy them exactly; never add names from memory.
 
 Previous turn (STEP 5):
 - session_state.previous_turn_tool_activity lists what tools did in the previous
@@ -337,7 +349,7 @@ agent = Agent(
 
     # STEP 5: guard around every tool call + tool-activity note after each run
     tool_hooks=[tool_guard],
-    post_hooks=[remember_tool_activity],
+    post_hooks=[remember_tool_activity, grounding_hook],  # STEP 7: grounding check
     session_state={"previous_turn_tool_activity": []},
     add_session_state_to_context=True,
 
@@ -378,6 +390,27 @@ async def chat_turn(text: str, user_id: str, session_id: str) -> None:
     _last_language[session_id] = lang
     deps = {"reply_language": language_instruction(lang)}
 
+    run_id = await run_once(text, user_id, session_id, deps)
+
+    # STEP 7: grounding check (computed by grounding_hook after the run)
+    report = pop_report(run_id)
+    if report is None or not report.checked:
+        return
+    if report.ok:
+        print(f"  [grounding] OK: {report.summary()}")
+        return
+    print(f"  [grounding] WARNING: {report.summary()}")
+    if GROUNDING_MODE == "retry":  # ONE automatic correction, then stop
+        print("  [grounding] asking the model to correct its answer...\nAI: ", end="")
+        retry_id = await run_once(correction_prompt(report), user_id, session_id, deps)
+        second = pop_report(retry_id)
+        if second is not None and second.checked:
+            label = "OK" if second.ok else "STILL UNVERIFIED (check the sources)"
+            print(f"  [grounding] after correction: {label}: {second.summary()}")
+
+
+async def run_once(text: str, user_id: str, session_id: str, deps: dict):
+    """One run, including any pauses. Returns the run_id."""
     stream = agent.arun(
         text,
         user_id=user_id,
@@ -389,7 +422,7 @@ async def chat_turn(text: str, user_id: str, session_id: str) -> None:
     )
     # STEP 3: one turn may pause several times (ask -> approve -> ...).
     # Each pause: collect the answers, then continue the SAME run.
-    paused = await render_stream(stream)
+    paused, run_id = await render_stream(stream)
     while paused is not None:
         resolve_requirements(paused.requirements or [])
         print("AI: ", end="")
@@ -402,13 +435,15 @@ async def chat_turn(text: str, user_id: str, session_id: str) -> None:
             stream=True,
             stream_events=True,
         )
-        paused = await render_stream(stream)
+        paused, run_id = await render_stream(stream)
+    return run_id
 
 
 async def render_stream(stream):
-    """Print one stream. Returns the RunPaused event if the run paused, else None."""
-    paused = None
+    """Print one stream. Returns (RunPaused event or None, run_id)."""
+    paused, run_id = None, None
     async for ev in stream:
+        run_id = getattr(ev, "run_id", None) or run_id
         if ev.event == RunEvent.run_paused:                       # STEP 3
             paused = ev
         elif ev.event == RunEvent.run_content and ev.content:
@@ -424,7 +459,7 @@ async def render_stream(stream):
         elif ev.event == RunEvent.run_error:
             print(f"\n  [error] {ev.content}")
     print()
-    return paused
+    return paused, run_id
 
 
 # ---------------------------------------------------------------------------
