@@ -2,7 +2,7 @@
 .venv/
 __pycache__/
 *.pyc
-agent.db
+agent.db*
 audit.log
 .doc_cache/
 .spotlight_secret
