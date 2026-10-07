@@ -52,6 +52,14 @@ STEP 7: grounding check (grounding.py).
   [x] Unverified -> one automatic correction run (GROUNDING_MODE=retry),
       or just a warning (warn), or off
 
+STEP 8: search across all documents + one-line summaries (search_index.py).
+  [x] search_documents: hybrid search (pgvector meaning + Arabic-stemmed
+      keywords, merged with RRF) over ALL the user's files, with doc_id + page
+  [x] find_in_document: doc_id "all" searches every file; Arabic-tolerant
+      matching (diacritics, أ/إ/آ, ى/ي, ة/ه, Arabic digits)
+  [x] One-line summary per file in AVAILABLE DOCUMENTS (housekeeping model)
+  [x] Files indexed automatically when new/changed; /reindex command
+
 Setup:
   pip install agno openai httpx python-dotenv sqlalchemy pymupdf python-docx openpyxl
   Put files in docs/<user_id>/  (default user: docs/demo-user/)
@@ -90,7 +98,10 @@ from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExport
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 
+dotenv.load_dotenv()  # BEFORE our modules: they read settings (.env) at import time
+
 from doc_tools import DOCS_ROOT, DOCUMENT_TOOLS  # STEP 4
+from search_index import ensure_indexed, search_documents  # STEP 8
 from tool_guard import AUDIT_LOG, remember_tool_activity, tool_guard  # STEP 5
 from language import REFUSAL, detect_language, language_instruction  # language rule
 from doc_tools import documents_block  # STEP 6
@@ -317,10 +328,17 @@ Asking the user:
 - Don't ask for things you already know. If the user skips a question,
   don't ask it again: continue with a sensible default and say which one.
 
-Documents (STEP 4 + 6):
+Documents (STEP 4 + 6 + 8):
 - The AVAILABLE DOCUMENTS list at the end of these instructions shows the user's
-  files with their doc_ids. Use those doc_ids directly. Call list_documents only
-  if the list says more are not shown, or the user mentions a file not in it.
+  files with their doc_ids and a one-line summary of each. Use the summaries to
+  pick the right file. Call list_documents only if the list says more are not
+  shown, or the user mentions a file not in it.
+- Choosing a search tool:
+  * Don't know which document, or the question spans several -> search_documents
+    (searches ALL documents by meaning and keywords).
+  * Exact phrase/name/number -> find_in_document (doc_id "all" searches every file).
+  * If one search finds nothing, try the other tool and other wording (synonyms,
+    singular/plural, Arabic and English) BEFORE saying "not found".
 - Before answering about a document's content, read it with read_document
   (once per document per answer), or use find_in_document for a specific term.
 - You do NOT keep document text between turns: read again in each new answer.
@@ -364,6 +382,7 @@ agent = Agent(
         get_current_time,
         calculate,
         *DOCUMENT_TOOLS,                               # STEP 4: list/read/find
+        search_documents,                              # STEP 8: search ALL docs
         save_note,                                     # STEP 3: needs approval
         UserFeedbackTools(),                           # STEP 3: ask_user (choices)
         UserControlFlowTools(add_instructions=False),  # STEP 3: get_user_input (text);
@@ -414,6 +433,15 @@ async def chat_turn(text: str, user_id: str, session_id: str) -> None:
         return
     _last_language[session_id] = lang
     deps = {"reply_language": language_instruction(lang)}
+
+    # STEP 8: index new/changed files before the run (cheap when nothing changed).
+    # In a server this belongs in the upload pipeline instead.
+    try:
+        stats = await asyncio.to_thread(ensure_indexed, user_id, lambda m: print(f"  [index] {m}"))
+        if stats["indexed"] or stats["removed"]:
+            print(f"  [index] {stats['indexed']} indexed, {stats['removed']} removed")
+    except Exception as e:  # search still degrades gracefully
+        print(f"  [index] skipped: {e}")
 
     run_id = await run_once(text, user_id, session_id, deps)
 
@@ -556,7 +584,7 @@ async def main() -> None:
     session_id = os.getenv("SESSION_ID") or str(uuid.uuid4())
     print(f"model={MODEL_ID} user={user_id} session={session_id}")
     print(f"Documents folder: {DOCS_ROOT / user_id}")
-    print("Commands: /memories  /summary  /docs  /activity  /audit  /new   (Ctrl+C to quit)\n")
+    print("Commands: /memories  /summary  /docs  /reindex  /activity  /audit  /new   (Ctrl+C to quit)\n")
     while True:
         try:
             text = input("You: ").strip()
@@ -568,6 +596,9 @@ async def main() -> None:
             await show_memories(user_id)
         elif text == "/summary":
             await show_summary(session_id)
+        elif text == "/reindex":  # STEP 8: (re)index changed files now
+            stats = await asyncio.to_thread(ensure_indexed, user_id, lambda m: print(f"  [index] {m}"))
+            print(f"  {stats}")
         elif text == "/docs":  # STEP 4: what the agent can see
             from agno.run import RunContext
             from doc_tools import list_documents
@@ -590,7 +621,7 @@ async def main() -> None:
             except FileNotFoundError:
                 print("  (no tool calls yet)")
         elif text.startswith("/"):  # typo like "/memory": don't send to the model
-            print("  Unknown command. Try /memories /summary /docs /activity /audit /new")
+            print("  Unknown command. Try /memories /summary /docs /reindex /activity /audit /new")
         else:
             print("AI: ", end="")
             await chat_turn(text, user_id, session_id)

@@ -180,20 +180,29 @@ def list_documents(run_context: RunContext) -> str:
 
 
 def documents_block(user_id: str, session_id: str, limit: int = 50) -> str:
-    """STEP 6: the AVAILABLE DOCUMENTS list for the system prompt (handles +
-    fenced names only, never content). Newest first; long lists are cut."""
+    """STEP 6 + 8: the AVAILABLE DOCUMENTS list for the system prompt: handles,
+    fenced names and a one-line summary per file (never the content).
+    Newest first; long lists are cut."""
     ctx = RunContext(run_id="prompt", session_id=session_id, user_id=user_id)
     docs = sorted(_list_docs(ctx), key=lambda d: d.path.stat().st_mtime, reverse=True)
     if not docs:
         return "AVAILABLE DOCUMENTS: none. If the user asks about documents, tell them to add files."
+    try:  # STEP 8: summaries come from the search index (if indexed)
+        from search_index import get_summaries
+        summaries = get_summaries(user_id)
+    except Exception:
+        summaries = {}
     n = nonce_for(session_id)
     lines = [f"AVAILABLE DOCUMENTS ({len(docs)}), newest first:"]
     for d in docs[:limit]:
         kb = max(1, d.path.stat().st_size // 1024)
-        lines.append(f"- {d.doc_id}: {fence_inline(d.rel, n)} ({kb} KB)")
+        line = f"- {d.doc_id}: {fence_inline(d.rel, n)} ({kb} KB)"
+        if d.rel in summaries:  # model-written from document text -> untrusted
+            line += f" - {fence_inline(summaries[d.rel], n, limit=240)}"
+        lines.append(line)
     if len(docs) > limit:
         lines.append(f"... {len(docs) - limit} more not shown: call list_documents to see all.")
-    lines.append("Use these doc_ids directly with read_document / find_in_document.")
+    lines.append("Use these doc_ids directly with read_document / find_in_document / search_documents.")
     return "\n".join(lines)
 
 
@@ -233,6 +242,42 @@ def read_document(doc_id: str, run_context: RunContext) -> str:
     return header + fence(text, n, source=f"{doc.doc_id}") + note
 
 
+# STEP 8: Arabic-tolerant matching. Each character is mapped 1:1 (or dropped,
+# for diacritics/tatweel) and we keep the original index of every kept char,
+# so a match in the normalised text points back to the exact original wording.
+_DROP = set(chr(c) for c in list(range(0x0610, 0x061B)) + list(range(0x064B, 0x0660)) + [0x0670, 0x0640])
+_FOLD = {"أ": "ا", "إ": "ا", "آ": "ا", "ٱ": "ا", "ى": "ي", "ة": "ه", "ؤ": "و", "ئ": "ي",
+         **{chr(0x0660 + i): str(i) for i in range(10)}, **{chr(0x06F0 + i): str(i) for i in range(10)}}
+
+
+def _norm_with_map(text: str) -> Tuple[str, List[int]]:
+    out, idx = [], []
+    for i, ch in enumerate(text):
+        if ch in _DROP:
+            continue
+        out.append(_FOLD.get(ch, ch).lower())
+        idx.append(i)
+    return "".join(out), idx
+
+
+def _find_in_one(doc: Doc, query: str, max_results: int, context_chars: int):
+    """Returns (total_matches, [snippet lines]) for one document."""
+    text, starts = _render(_pages(doc))
+    norm, idx = _norm_with_map(text)
+    qnorm, _ = _norm_with_map(query)
+    words = [re.escape(w) for w in qnorm.split()]
+    pattern = re.compile(r"\s+".join(words))
+    matches = list(pattern.finditer(norm))
+    lines = []
+    for m in matches[:max_results]:
+        o_start, o_end = idx[m.start()], idx[m.end() - 1] + 1   # back to original text
+        page_start, page_end, label = _page_span(starts, o_start, len(text))
+        a = max(page_start, o_start - context_chars)  # context stays on its page
+        b = min(page_end, o_end + context_chars)
+        lines.append(f"[{label}] ...{' '.join(text[a:b].split())}...")
+    return len(matches), lines
+
+
 def find_in_document(
     doc_id: str,
     query: str,
@@ -240,51 +285,60 @@ def find_in_document(
     max_results: int = 20,
     context_chars: int = 80,
 ) -> str:
-    """Search a document for a word or phrase (like Ctrl+F) and return each
-    match with surrounding text and its page. Matching ignores case and extra
-    spaces. Use for targeted lookups (a clause, name, number, date) instead of
-    reading the whole document, and for documents that were truncated.
+    """Find an exact word or phrase (like Ctrl+F) and return each match with
+    surrounding text and its page. Matching ignores case, extra spaces,
+    Arabic diacritics and letter variants (أ/إ/آ=ا, ى=ي, ة=ه, ٤٦=46).
+    Use for targeted lookups (a clause, name, number, date) instead of reading
+    a whole document. Pass doc_id "all" (or "") to search EVERY document.
+    If nothing is found, try search_documents (it also matches by meaning).
 
     Args:
-        doc_id: The handle from list_documents, e.g. "doc-1a2b3c".
+        doc_id: The handle, e.g. "doc-1a2b3c", or "all" to search all documents.
         query: The exact word or phrase to find, e.g. "termination".
         max_results: Maximum matches to return (default 20).
         context_chars: Characters of context on each side (default 80).
     """
-    doc = _resolve(doc_id, run_context)
-    if not doc:
-        return _not_found(doc_id)
     if not query.strip():
         return "Empty query. Give a word or phrase to search for."
     n = nonce_for(run_context.session_id)
-    name = fence_inline(doc.rel, n)
-    try:
-        text, starts = _render(_pages(doc))
-    except Exception as e:
-        return f"Could not read {name}: {e}"
-
-    # Normalise query: words separated by any whitespace, case-insensitive.
-    words = [re.escape(w) for w in query.split()]
-    pattern = re.compile(r"\s+".join(words), re.IGNORECASE)
-    matches = list(pattern.finditer(text))
-    if not matches:
-        return f'No matches for "{query}" in {name}. Try a shorter or different phrase.'
-
     max_results = max(1, min(max_results, 50))
-    context_chars = max(20, min(context_chars, 500))
-    header = f'{len(matches)} match(es) for "{query}" in {doc.doc_id} ({name}):'
-    hits = []
-    for m in matches[:max_results]:
-        page_start, page_end, label = _page_span(starts, m.start(), len(text))
-        a = max(page_start, m.start() - context_chars)  # context stays on its page
-        b = min(page_end, m.end() + context_chars)
-        snippet = " ".join(text[a:b].split())  # one line for readability
-        hits.append(f"- [{label}] ...{snippet}...")
-    more = ""
-    if len(matches) > max_results:
-        more = f"\n({len(matches) - max_results} more not shown; refine the query.)"
+    context_chars = max(20, min(context_chars, 1500))
+
+    all_docs = doc_id.strip().lower() in ("", "all", "*")
+    if all_docs:
+        docs = _list_docs(run_context)
+        if not docs:
+            return "The user has no documents yet."
+    else:
+        doc = _resolve(doc_id, run_context)
+        if not doc:
+            return _not_found(doc_id)
+        docs = [doc]
+
+    total, blocks, budget = 0, [], max_results
+    for doc in docs:
+        try:
+            count, lines = _find_in_one(doc, query, budget, context_chars)
+        except Exception as e:
+            blocks.append(f"{doc.doc_id}: could not read ({e})")
+            continue
+        total += count
+        if lines:
+            label = f"{doc.doc_id} ({doc.rel})" if all_docs else ""
+            blocks += [f"- {label + ' ' if label else ''}{line}" for line in lines]
+            budget -= len(lines)
+        if budget <= 0:
+            break
+
+    where = f"{len(docs)} documents" if all_docs else f"{docs[0].doc_id} ({fence_inline(docs[0].rel, n)})"
+    if total == 0:
+        return (f'No matches for "{query}" in {where}. Try a shorter phrase, another word '
+                "form, or search_documents (matches by meaning).")
+    header = f'{total} match(es) for "{query}" in {where}:'
+    shown = max_results - max(budget, 0)
+    more = f"\n({total - shown} more not shown; refine the query.)" if total > shown else ""
     # STEP 6: snippets are untrusted data; header/notes stay outside the fence
-    return header + "\n" + fence("\n".join(hits), n, source=doc.doc_id) + more
+    return header + "\n" + fence("\n".join(blocks), n, source="find_in_document") + more
 
 
-DOCUMENT_TOOLS = [list_documents, read_document, find_in_document]
+DOCUMENT_TOOLS = [list_documents, read_document, find_in_document]  # + search_documents (search_index.py)

@@ -6,5 +6,9 @@ sqlalchemy
 pymupdf
 python-docx
 openpyxl
+# step 8: search across documents
+numpy
+psycopg[binary]
+pgvector
 # optional: better English vs other-Latin-language detection (~100 MB)
 # lingua-language-detector

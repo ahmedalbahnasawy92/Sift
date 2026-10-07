@@ -36,7 +36,7 @@ from spotlight import fence_inline, nonce_for  # STEP 6
 
 AUDIT_LOG = os.getenv("AUDIT_LOG", "audit.log")
 MAX_TOOL_RESULT_CHARS = int(os.getenv("MAX_TOOL_RESULT_CHARS", "120000"))
-DOCUMENT_TOOLS = {"list_documents", "read_document", "find_in_document"}
+DOCUMENT_TOOLS = {"list_documents", "read_document", "find_in_document", "search_documents"}
 
 # run_id -> set of documents already read in that run (cleared after the run)
 _reads_by_run: Dict[str, set] = {}
@@ -138,7 +138,9 @@ def _activity_line(t, n: str) -> str:
             return ""
         return f"- read_document -> {_first_line(t.result)}"
     if name == "find_in_document":
-        return f"- find_in_document({args.get('doc_id')}, \"{args.get('query')}\") -> {_first_line(t.result)}"
+        return f"- find_in_document({args.get('doc_id') or 'all'}, \"{args.get('query')}\") -> {_first_line(t.result)}"
+    if name == "search_documents":                                   # STEP 8: ids only
+        return f"- search_documents(\"{args.get('query')}\") -> {_first_line(t.result, 200)}"
     if name == "ask_user":                                           # user's choices
         qs = getattr(t, "user_feedback_schema", None) or []
         rows = [(q.question, q.selected_options) for q in qs] or [
