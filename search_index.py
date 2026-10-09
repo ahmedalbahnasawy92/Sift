@@ -57,6 +57,10 @@ EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "BAAI/bge-m3")
 EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "1024"))
 EMBEDDING_BASE_URL = os.getenv("EMBEDDING_BASE_URL") or os.getenv("OPENAI_BASE_URL")
 EMBEDDING_API_KEY = os.getenv("EMBEDDING_API_KEY") or os.getenv("OPENAI_API_KEY") or "none"
+# Optional task hints for models that embed queries and passages differently
+# (Jina: retrieval.query / retrieval.passage). Leave empty for bge-m3 & co.
+EMBEDDING_QUERY_TASK = os.getenv("EMBEDDING_QUERY_TASK", "").strip()
+EMBEDDING_PASSAGE_TASK = os.getenv("EMBEDDING_PASSAGE_TASK", "").strip()
 SUMMARY_MODEL = os.getenv("SUMMARY_MODEL") or os.getenv("HOUSEKEEPING_MODEL", "adept3o")  # same default as the agent
 SUMMARY_BASE_URL = os.getenv("SUMMARY_BASE_URL") or os.getenv("OPENAI_BASE_URL")
 SUMMARY_API_KEY = os.getenv("SUMMARY_API_KEY") or os.getenv("OPENAI_API_KEY") or "none"
@@ -130,13 +134,15 @@ class Embedder:
             self._client = OpenAI(base_url=EMBEDDING_BASE_URL, api_key=EMBEDDING_API_KEY, timeout=60)
         return self._client
 
-    def embed(self, texts: List[str]) -> Optional[List[List[float]]]:
+    def embed(self, texts: List[str], task: str = "") -> Optional[List[List[float]]]:
         if not self.enabled or not texts:
             return None
+        extra = {"task": task} if task else None
         try:
             vectors = []
             for i in range(0, len(texts), 32):
-                resp = self._get().embeddings.create(model=EMBEDDING_MODEL, input=texts[i:i + 32])
+                resp = self._get().embeddings.create(model=EMBEDDING_MODEL, input=texts[i:i + 32],
+                                                     extra_body=extra)
                 vectors += [d.embedding for d in resp.data]
             return vectors
         except Exception as e:  # keyword search still works without embeddings
@@ -410,7 +416,7 @@ def ensure_indexed(user_id: str, progress=None, force: bool = False) -> Dict[str
             log.warning("Could not extract %s: %s", rel, e)
             continue
         chunks = chunk_pages(pages)
-        vectors = _embedder.embed([c[1] for c in chunks]) if chunks else None
+        vectors = _embedder.embed([c[1] for c in chunks], EMBEDDING_PASSAGE_TASK) if chunks else None
         summary = summarize(rel, pages) if any(t.strip() for _, t in pages) else "(no extractable text)"
         store.replace_doc(user_id, doc, version, summary, chunks, vectors)
         stats["indexed"] += 1
@@ -449,7 +455,7 @@ def search_documents(query: str, run_context: RunContext, doc_ids: str = "", top
     ids = [d.strip() for d in doc_ids.split(",") if d.strip()]
     qvec = None
     if _embedder.enabled:
-        vecs = _embedder.embed([query])
+        vecs = _embedder.embed([query], EMBEDDING_QUERY_TASK)
         qvec = vecs[0] if vecs else None
     hits = get_store().search(user_id, query, qvec, ids, max(1, min(int(top_k), 20)))
     if not hits:

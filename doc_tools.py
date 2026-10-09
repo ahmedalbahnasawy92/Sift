@@ -14,7 +14,9 @@ Mike ideas kept:
 Fixes over Mike:
   - read_document is CAPPED (Mike sends 1,000-page files whole and overflows).
   - Extracted text is cached for every file type (Mike re-extracts each turn).
-  - Scanned PDFs say "no text, OCR needed" instead of returning nothing.
+  - PDFs are OCR'd with Nanonets OCR2 (like Mujeeb) when NANO_OCR_API_BASE_URL
+    is set: every page by default, since Arabic text layers are often broken.
+    Warm the cache once with:  python doc_tools.py --extract docs/<user_id>
 
 Permissions: each user only sees docs/<user_id>/. The user_id comes from the
 run (RunContext), never from the model, so the model can't ask for another
@@ -31,6 +33,9 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 from agno.run import RunContext
+from dotenv import load_dotenv
+
+load_dotenv()  # OCR settings are read at import, before agno_agent loads .env
 
 from spotlight import fence, fence_inline, nonce_for  # STEP 6
 
@@ -38,6 +43,31 @@ DOCS_ROOT = Path(os.getenv("DOCS_ROOT", "docs"))
 CACHE_DIR = Path(os.getenv("DOC_CACHE_DIR", ".doc_cache"))
 MAX_READ_CHARS = int(os.getenv("MAX_READ_CHARS", "100000"))  # ~25k tokens
 SUPPORTED = {".pdf", ".docx", ".xlsx", ".txt", ".md", ".csv", ".json"}
+
+# OCR for PDFs (Nanonets OCR2 behind an OpenAI-compatible endpoint, as in Mujeeb).
+#   OCR_MODE=all      OCR every page. Arabic PDF text layers are often broken
+#                     (reversed words, split ligatures), so this is the default.
+#   OCR_MODE=missing  OCR only pages with no text layer (scanned pages).
+#   OCR_MODE=off      text layer only.
+# OCR is off when NANO_OCR_API_BASE_URL is not set. Results are cached per file.
+OCR_URL = os.getenv("NANO_OCR_API_BASE_URL", "").rstrip("/")
+OCR_MODEL = os.getenv("NANO_OCR_MODEL", "ocr")
+OCR_API_KEY = os.getenv("NANO_OCR_API_KEY") or os.getenv("OPENAI_API_KEY", "none")
+OCR_MAX_TOKENS = int(os.getenv("NANO_OCR_MAX_TOKENS", "4096"))
+OCR_MODE = os.getenv("OCR_MODE", "all") if OCR_URL else "off"
+OCR_DPI = int(os.getenv("OCR_DPI", "200"))
+OCR_WORKERS = int(os.getenv("OCR_WORKERS", "4"))
+OCR_MIN_CHARS = 50  # a page with less text than this counts as scanned
+OCR_PROMPT = (
+    "Extract the text from the above document as if you were reading it naturally. "
+    "Return the tables in html format. Return the equations in LaTeX representation. "
+    "If there is an image in the document and image caption is not present, add a small "
+    "description of the image inside the <img></img> tag; otherwise, add the image caption "
+    "inside <img></img>. Watermarks should be wrapped in brackets. Ex: "
+    "<watermark>OFFICIAL COPY</watermark>. Page numbers should be wrapped in brackets. Ex: "
+    "<page_number>14</page_number> or <page_number>9/22</page_number>. "
+    "Prefer using ☐ and ☑ for check boxes."
+)
 
 
 # ---------------------------------------------------------------------------
@@ -93,12 +123,69 @@ def _not_found(doc_id: str) -> str:
 # ---------------------------------------------------------------------------
 # Text extraction -> list of (page_label, text). Cached by file content hash.
 # ---------------------------------------------------------------------------
+def _ocr_image(img: bytes) -> str:
+    """One page image (JPEG) -> markdown via the Nanonets OCR model (OpenAI-
+    compatible vision endpoint). Same prompt as Mujeeb: tables as HTML."""
+    import base64
+    import httpx
+    body = {
+        "model": OCR_MODEL,
+        "temperature": 0.0,
+        "max_tokens": OCR_MAX_TOKENS,
+        "messages": [{"role": "user", "content": [
+            {"type": "image_url",
+             "image_url": {"url": "data:image/jpeg;base64," + base64.b64encode(img).decode()}},
+            {"type": "text", "text": OCR_PROMPT},
+        ]}],
+    }
+    headers = {"Authorization": f"Bearer {OCR_API_KEY}"}
+    for attempt in range(3):
+        try:
+            r = httpx.post(f"{OCR_URL}/chat/completions", json=body, headers=headers, timeout=180)
+            r.raise_for_status()
+            return r.json()["choices"][0]["message"]["content"] or ""
+        except Exception:
+            if attempt == 2:
+                raise
+    return ""
+
+
+def _extract_pdf(path: Path) -> List[Tuple[str, str]]:
+    """Text layer per page; OCR per OCR_MODE. A page whose OCR fails keeps its
+    text layer, so one bad page never loses the whole document."""
+    import pymupdf
+    from concurrent.futures import ThreadPoolExecutor
+    with pymupdf.open(path) as pdf:
+        layer = [page.get_text() for page in pdf]
+        if OCR_MODE == "all":
+            todo = list(range(len(layer)))
+        elif OCR_MODE == "missing":   # scanned pages only
+            todo = [i for i, t in enumerate(layer) if len(t.strip()) < OCR_MIN_CHARS]
+        else:
+            todo = []
+
+        # Render here (pymupdf is not thread-safe); only the HTTP calls run in parallel
+        images = {i: pdf[i].get_pixmap(dpi=OCR_DPI).tobytes("jpeg", jpg_quality=85) for i in todo}
+
+    def run(i):
+        try:
+            return i, _ocr_image(images[i])
+        except Exception:
+            return i, None
+
+    texts = list(layer)
+    if todo:
+        with ThreadPoolExecutor(max_workers=OCR_WORKERS) as pool:
+            for i, ocr in pool.map(run, todo):
+                if ocr and ocr.strip():
+                    texts[i] = ocr
+    return [(f"Page {i}", t) for i, t in enumerate(texts, 1)]
+
+
 def _extract(path: Path) -> List[Tuple[str, str]]:
     ext = path.suffix.lower()
     if ext == ".pdf":
-        import pymupdf
-        with pymupdf.open(path) as pdf:
-            return [(f"Page {i}", page.get_text()) for i, page in enumerate(pdf, 1)]
+        return _extract_pdf(path)
     if ext == ".docx":
         import docx
         d = docx.Document(str(path))
@@ -122,6 +209,8 @@ def _extract(path: Path) -> List[Tuple[str, str]]:
 def _pages(doc: Doc) -> List[Tuple[str, str]]:
     data = doc.path.read_bytes()
     key = hashlib.sha256(data).hexdigest()
+    if doc.path.suffix.lower() == ".pdf" and OCR_MODE != "off":
+        key += f"-ocr-{OCR_MODE}"  # OCR text is cached separately from the text layer
     cache = CACHE_DIR / f"{key}.txt"
     sep = "\n\x1e"  # record separator between pages in the cache file
     if cache.exists():
@@ -228,8 +317,10 @@ def read_document(doc_id: str, run_context: RunContext) -> str:
 
     text, starts = _render(pages)
     if not any(t.strip() for _, t in pages):
+        hint = ("OCR found no text either" if OCR_MODE != "off"
+                else "OCR is off: set NANO_OCR_API_BASE_URL")
         return (f"{name} has no extractable text. It may be a scanned PDF "
-                "(OCR is not supported yet). Tell the user.")
+                f"({hint}). Tell the user.")
 
     header = f"Document {doc.doc_id}: {name} ({len(pages)} section(s), {len(text):,} chars)\n\n"
     note = ""
@@ -342,3 +433,20 @@ def find_in_document(
 
 
 DOCUMENT_TOOLS = [list_documents, read_document, find_in_document]  # + search_documents (search_index.py)
+
+
+if __name__ == "__main__":
+    # Warm the text cache (runs OCR once) so the first question doesn't wait:
+    #   python doc_tools.py --extract docs/demo-user
+    import sys
+    import time
+    if len(sys.argv) == 3 and sys.argv[1] == "--extract":
+        for p in sorted(Path(sys.argv[2]).iterdir()):
+            if p.is_file() and p.suffix.lower() in SUPPORTED and not p.name.startswith("."):
+                t0 = time.time()
+                pages = _pages(Doc("", p, p.name))
+                chars = sum(len(t) for _, t in pages)
+                print(f"{p.name}: {len(pages)} section(s), {chars:,} chars, "
+                      f"{time.time() - t0:.0f}s (OCR_MODE={OCR_MODE})")
+    else:
+        print("usage: python doc_tools.py --extract docs/<user_id>")
