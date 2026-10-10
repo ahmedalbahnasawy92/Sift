@@ -1,0 +1,47 @@
+# LiteLLM proxy for Sift: three model aliases, one place for logs, retries and fallbacks.
+# Start with:  ./litellm/run_proxy.sh   (reads Sift's .env)
+#
+#   sift-local   adept3o on the local vLLM server (16k context, data stays on-prem)
+#   sift-fast    deepseek-v4-flash on OpenRouter (default agent model)
+#   sift-strong  glm-5.2 on OpenRouter (step-up model; used by fallbacks for now)
+
+model_list:
+  - model_name: sift-local
+    litellm_params:
+      model: openai/adept3o                  # OpenAI-compatible vLLM endpoint
+      api_base: os.environ/ADEPT3O_BASE_URL
+      api_key: os.environ/ADEPT3O_API_KEY
+    model_info:
+      max_input_tokens: 16384                # vLLM max_model_len: prompt + output must fit
+      max_output_tokens: 4096
+      supports_function_calling: true
+
+  - model_name: sift-fast
+    litellm_params:
+      model: openrouter/deepseek/deepseek-v4-flash
+      api_key: os.environ/OPENROUTER_API_KEY
+
+  - model_name: sift-strong
+    litellm_params:
+      model: openrouter/z-ai/glm-5.2
+      api_key: os.environ/OPENROUTER_API_KEY
+
+router_settings:
+  num_retries: 2                 # retry the same model on 429 / 5xx / timeouts
+  timeout: 180                   # seconds per call
+  allowed_fails: 3               # failures per minute before a model is cooled down
+  cooldown_time: 30              # seconds a failing model is skipped
+  enable_pre_call_checks: true   # reject prompts larger than model_info.max_input_tokens
+  # Fallbacks only between the cloud models. sift-local has none on purpose:
+  # falling back from the local model to the cloud would send its data out
+  # (needed later for private folders).
+  fallbacks:
+    - sift-fast: [sift-strong]
+    - sift-strong: [sift-fast]
+
+litellm_settings:
+  callbacks: ["langfuse_otel"]   # every call -> Langfuse (LANGFUSE_HOST / keys from .env)
+  drop_params: true              # drop params a provider doesn't support instead of failing
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY

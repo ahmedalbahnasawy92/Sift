@@ -61,9 +61,14 @@ EMBEDDING_API_KEY = os.getenv("EMBEDDING_API_KEY") or os.getenv("OPENAI_API_KEY"
 # (Jina: retrieval.query / retrieval.passage). Leave empty for bge-m3 & co.
 EMBEDDING_QUERY_TASK = os.getenv("EMBEDDING_QUERY_TASK", "").strip()
 EMBEDDING_PASSAGE_TASK = os.getenv("EMBEDDING_PASSAGE_TASK", "").strip()
-SUMMARY_MODEL = os.getenv("SUMMARY_MODEL") or os.getenv("HOUSEKEEPING_MODEL", "adept3o")  # same default as the agent
-SUMMARY_BASE_URL = os.getenv("SUMMARY_BASE_URL") or os.getenv("OPENAI_BASE_URL")
-SUMMARY_API_KEY = os.getenv("SUMMARY_API_KEY") or os.getenv("OPENAI_API_KEY") or "none"
+# Summaries use the housekeeping model: via the LiteLLM proxy (alias sift-local)
+# when LITELLM_BASE_URL is set, else directly on OPENAI_BASE_URL.
+_PROXY = os.getenv("LITELLM_BASE_URL", "").strip()
+SUMMARY_MODEL = (os.getenv("SUMMARY_MODEL") or os.getenv("HOUSEKEEPING_MODEL")
+                 or ("sift-local" if _PROXY else "adept3o"))  # same default as the agent
+SUMMARY_BASE_URL = os.getenv("SUMMARY_BASE_URL") or _PROXY or os.getenv("OPENAI_BASE_URL")
+SUMMARY_API_KEY = (os.getenv("SUMMARY_API_KEY")
+                   or (os.getenv("LITELLM_API_KEY") if _PROXY else os.getenv("OPENAI_API_KEY")) or "none")
 CHUNK_CHARS = int(os.getenv("CHUNK_CHARS", "1000"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "150"))
 RRF_K = 60

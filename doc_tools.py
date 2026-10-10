@@ -295,20 +295,8 @@ def documents_block(user_id: str, session_id: str, limit: int = 50) -> str:
     return "\n".join(lines)
 
 
-def read_document(doc_id: str, run_context: RunContext) -> str:
-    """Read the full text of one document, with [Page N] markers.
-    Call this before answering questions about, summarising or quoting a
-    document. Read each document at most ONCE per answer; after that use the
-    text you already have, or find_in_document for a specific phrase.
-    For very large documents the text is cut off: use find_in_document then.
-
-    Args:
-        doc_id: The handle from list_documents, e.g. "doc-1a2b3c".
-    """
-    doc = _resolve(doc_id, run_context)
-    if not doc:
-        return _not_found(doc_id)
-    n = nonce_for(run_context.session_id)
+def _read_one(doc: Doc, n: str, limit: int) -> str:
+    """Header + fenced text of one document, cut at `limit` characters."""
     name = fence_inline(doc.rel, n)
     try:
         pages = _pages(doc)
@@ -324,13 +312,164 @@ def read_document(doc_id: str, run_context: RunContext) -> str:
 
     header = f"Document {doc.doc_id}: {name} ({len(pages)} section(s), {len(text):,} chars)\n\n"
     note = ""
-    if len(text) > MAX_READ_CHARS:
-        last = _label_at(starts, MAX_READ_CHARS)
-        note = (f"\n\n[TRUNCATED at {MAX_READ_CHARS:,} of {len(text):,} chars, in {last}. "
+    if len(text) > limit:
+        last = _label_at(starts, limit)
+        note = (f"\n\n[TRUNCATED at {limit:,} of {len(text):,} chars, in {last}. "
                 "Use find_in_document to look for specific terms in the rest.]")
-        text = text[:MAX_READ_CHARS]
+        text = text[:limit]
     # STEP 6: the body is untrusted data; our notes stay OUTSIDE the fence
     return header + fence(text, n, source=f"{doc.doc_id}") + note
+
+
+def read_document(doc_id: str, run_context: RunContext) -> str:
+    """Read the full text of one document, with [Page N] markers.
+    Call this before answering questions about, summarising or quoting a
+    document. Read each document at most ONCE per answer; after that use the
+    text you already have, or find_in_document for a specific phrase.
+    For very large documents the text is cut off: use find_in_document then.
+    For spreadsheets, prefer read_table_cells (keeps rows, columns and cell refs).
+
+    Args:
+        doc_id: The handle from list_documents, e.g. "doc-1a2b3c".
+    """
+    doc = _resolve(doc_id, run_context)
+    if not doc:
+        return _not_found(doc_id)
+    return _read_one(doc, nonce_for(run_context.session_id), MAX_READ_CHARS)
+
+
+# ---------------------------------------------------------------------------
+# STEP 9: read several documents at once (Mike's fetch_documents)
+# ---------------------------------------------------------------------------
+MAX_FETCH_DOCS = int(os.getenv("MAX_FETCH_DOCS", "10"))
+
+
+def fetch_documents(doc_ids: str, run_context: RunContext) -> str:
+    """Read SEVERAL documents in one call (e.g. to compare them or answer a
+    question that spans them). The total size is capped and shared between the
+    documents, so use it for small/medium files; for one large document use
+    read_document, and for a specific term use find_in_document or
+    search_documents. Documents already read in this answer are skipped.
+
+    Args:
+        doc_ids: Comma-separated handles, e.g. "doc-1a2b3c, doc-4d5e6f" (max 10).
+    """
+    ids = [d.strip() for d in doc_ids.split(",") if d.strip()]
+    if not ids:
+        return "No doc_ids given. Pass comma-separated handles from the documents list."
+    ids = list(dict.fromkeys(ids))[:MAX_FETCH_DOCS]  # dedupe, keep order
+    n = nonce_for(run_context.session_id)
+    per_doc = max(5_000, MAX_READ_CHARS // len(ids))  # share the budget
+    parts, missing = [], []
+    for doc_id in ids:
+        doc = _resolve(doc_id, run_context)
+        if not doc:
+            missing.append(doc_id)
+            continue
+        parts.append(_read_one(doc, n, per_doc))
+    if missing:
+        parts.append(f"Not found: {', '.join(missing)}. Use the doc_ids from the documents list.")
+    header = f"{len(ids) - len(missing)} document(s), up to {per_doc:,} chars each:\n\n"
+    return header + "\n\n---\n\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# STEP 9: spreadsheet cells with coordinates (Mike's read_table_cells)
+# ---------------------------------------------------------------------------
+TABLE_TYPES = {".xlsx", ".csv"}
+MAX_TABLE_CELLS = int(os.getenv("MAX_TABLE_CELLS", "4000"))
+
+
+def _load_rows(doc: Doc, sheet: str) -> Tuple[str, List[str], List[List[str]]]:
+    """Returns (sheet_name, all_sheet_names, rows as lists of strings)."""
+    if doc.path.suffix.lower() == ".csv":
+        import csv
+        with open(doc.path, newline="", encoding="utf-8", errors="replace") as f:
+            rows = [[c for c in r] for r in csv.reader(f)]
+        return "csv", ["csv"], rows
+    import openpyxl
+    wb = openpyxl.load_workbook(doc.path, read_only=True, data_only=True)  # values, not formulas
+    names = wb.sheetnames
+    if sheet:
+        match = next((s for s in names if s.lower() == sheet.lower()), None)
+        if match is None:
+            raise KeyError(f"No sheet '{sheet}'. Sheets: {', '.join(names)}")
+        ws = wb[match]
+    else:
+        ws = wb[names[0]]
+    rows = [["" if v is None else str(v) for v in r] for r in ws.iter_rows(values_only=True)]
+    return ws.title, names, rows
+
+
+def _parse_range(cell_range: str) -> Tuple[int, int, int, int]:
+    """'B2:D10' -> (row1, col1, row2, col2), 1-based. '' -> whole sheet."""
+    from openpyxl.utils.cell import range_boundaries
+    min_col, min_row, max_col, max_row = range_boundaries(cell_range.upper().replace("$", ""))
+    return min_row or 1, min_col or 1, max_row or 10**9, max_col or 10**9
+
+
+def read_table_cells(
+    doc_id: str,
+    run_context: RunContext,
+    sheet: str = "",
+    cell_range: str = "",
+    max_rows: int = 100,
+) -> str:
+    """Read a spreadsheet (xlsx or csv) as a table WITH cell coordinates, so
+    you can cite exact cells (e.g. Budget!C7). Call first without cell_range to
+    see the sheets, size and header row; then read the rows you need.
+    Use this instead of read_document for spreadsheets: numbers stay in their
+    columns, so you don't mix up rows.
+
+    Args:
+        doc_id: Handle of an .xlsx or .csv document.
+        sheet: Sheet name (default: the first sheet).
+        cell_range: Excel range like "A1:F50", "B:B" or "3:20" (default: from the top).
+        max_rows: Maximum rows to return (default 100, max 500).
+    """
+    doc = _resolve(doc_id, run_context)
+    if not doc:
+        return _not_found(doc_id)
+    if doc.path.suffix.lower() not in TABLE_TYPES:
+        return f"{doc.doc_id} is not a spreadsheet (.xlsx/.csv). Use read_document instead."
+    n = nonce_for(run_context.session_id)
+    try:
+        title, names, rows = _load_rows(doc, sheet)
+    except Exception as e:
+        return f"Could not read the table: {e}"
+    from openpyxl.utils import get_column_letter
+
+    n_rows = len(rows)
+    n_cols = max((len(r) for r in rows), default=0)
+    overview = (f"{doc.doc_id} ({fence_inline(doc.rel, n)}): sheets {names}; "
+                f"sheet '{title}' has {n_rows} rows x {n_cols} columns "
+                f"(A1:{get_column_letter(max(n_cols, 1))}{max(n_rows, 1)}).")
+    if not rows:
+        return overview + " The sheet is empty."
+
+    try:
+        r1, c1, r2, c2 = _parse_range(cell_range) if cell_range.strip() else (1, 1, n_rows, n_cols)
+    except Exception:
+        return overview + f' Invalid cell_range "{cell_range}". Use e.g. "A1:F50", "B:B" or "3:20".'
+    r2, c2 = min(r2, n_rows), min(c2, n_cols)
+    max_rows = max(1, min(max_rows, 500))
+    max_rows = min(max_rows, max(1, MAX_TABLE_CELLS // max(1, c2 - c1 + 1)))  # cap total cells
+    last = min(r2, r1 + max_rows - 1)
+
+    cols = [get_column_letter(c) for c in range(c1, c2 + 1)]
+    lines = ["row | " + " | ".join(cols)]
+    if r1 > 1:  # always show the header row for context
+        header = rows[0] + [""] * n_cols
+        lines.append("1 | " + " | ".join(header[c1 - 1:c2]) + "   (header)")
+    for r in range(r1, last + 1):
+        row = rows[r - 1] + [""] * n_cols
+        lines.append(f"{r} | " + " | ".join(" ".join(v.split()) for v in row[c1 - 1:c2]))
+    shown = f"rows {r1}-{last}, columns {cols[0]}-{cols[-1]}"
+    more = ""
+    if last < r2:
+        more = f"\n[{r2 - last} more row(s) in this range: call again with cell_range starting at row {last + 1}.]"
+    return (overview + f"\nShowing {shown}. Cite cells as '{title}'!<column><row>.\n" +
+            fence("\n".join(lines), n, source=doc.doc_id) + more)
 
 
 # STEP 8: Arabic-tolerant matching. Each character is mapped 1:1 (or dropped,
@@ -432,7 +571,7 @@ def find_in_document(
     return header + "\n" + fence("\n".join(blocks), n, source="find_in_document") + more
 
 
-DOCUMENT_TOOLS = [list_documents, read_document, find_in_document]  # + search_documents (search_index.py)
+DOCUMENT_TOOLS = [list_documents, read_document, find_in_document, fetch_documents, read_table_cells]  # + search_documents (search_index.py)
 
 
 if __name__ == "__main__":

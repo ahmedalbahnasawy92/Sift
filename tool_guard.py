@@ -36,7 +36,8 @@ from spotlight import fence_inline, nonce_for  # STEP 6
 
 AUDIT_LOG = os.getenv("AUDIT_LOG", "audit.log")
 MAX_TOOL_RESULT_CHARS = int(os.getenv("MAX_TOOL_RESULT_CHARS", "120000"))
-DOCUMENT_TOOLS = {"list_documents", "read_document", "find_in_document", "search_documents"}
+DOCUMENT_TOOLS = {"list_documents", "read_document", "find_in_document", "search_documents",
+                  "fetch_documents", "read_table_cells"}
 
 # run_id -> set of documents already read in that run (cleared after the run)
 _reads_by_run: Dict[str, set] = {}
@@ -82,6 +83,25 @@ async def tool_guard(
             _audit(run_context, tool=function_name, args=safe_args, blocked="already_read")
             return ALREADY_READ
         reads.add(key)
+
+    # STEP 9: fetch_documents skips docs already read in this run, and marks
+    # the ones it reads, so a later read_document of the same doc is blocked.
+    if function_name == "fetch_documents":
+        reads = _reads_by_run.setdefault(run_context.run_id, set())
+        keep, skipped = [], []
+        for doc_id in [d.strip() for d in str(arguments.get("doc_ids", "")).split(",") if d.strip()]:
+            doc = _resolve(doc_id, run_context)
+            key = doc.rel if doc else doc_id
+            (skipped if key in reads else keep).append(doc_id)
+            reads.add(key)
+        if not keep:
+            _audit(run_context, tool=function_name, args=safe_args, blocked="already_read")
+            return ALREADY_READ
+        arguments = {**arguments, "doc_ids": ", ".join(keep)}
+        if skipped:
+            note = f"[Skipped, already read in this answer: {', '.join(skipped)}]\n"
+            result = await function_call(**arguments)
+            return note + str(result)
 
     # Run the tool; turn crashes into errors the model can act on
     error = None
@@ -139,6 +159,16 @@ def _activity_line(t, n: str) -> str:
         return f"- read_document -> {_first_line(t.result)}"
     if name == "find_in_document":
         return f"- find_in_document({args.get('doc_id') or 'all'}, \"{args.get('query')}\") -> {_first_line(t.result)}"
+    if name == "fetch_documents":                                    # STEP 9: ids only
+        heads = [l for l in str(t.result).splitlines() if l.startswith("Document doc-")]
+        return f"- fetch_documents -> " + "; ".join(h[:120] for h in heads[:10])
+    if name == "read_table_cells":
+        return (f"- read_table_cells({args.get('doc_id')}, sheet={args.get('sheet') or 'first'}, "
+                f"range={args.get('cell_range') or 'top'}) -> {_first_line(t.result, 160)}")
+    if name == "read_workflow":                                      # STEP 10
+        return f"- read_workflow({args.get('name')}) -> {_first_line(t.result, 120)}"
+    if name == "list_workflows":
+        return "- list_workflows"
     if name == "search_documents":                                   # STEP 8: ids only
         return f"- search_documents(\"{args.get('query')}\") -> {_first_line(t.result, 200)}"
     if name == "ask_user":                                           # user's choices

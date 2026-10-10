@@ -60,6 +60,16 @@ STEP 8: search across all documents + one-line summaries (search_index.py).
   [x] One-line summary per file in AVAILABLE DOCUMENTS (housekeeping model)
   [x] Files indexed automatically when new/changed; /reindex command
 
+STEP 9: complete Mike's read tools (doc_tools.py).
+  [x] fetch_documents: several documents in one call (shared size budget)
+  [x] read_table_cells: xlsx/csv with cell coordinates, sheets, ranges
+
+STEP 10: workflows = saved prompt templates (workflows.py, workflows/).
+  [x] SKILL.md folders, parsed/validated by Agno's LocalSkills
+  [x] shared + per-user workflows; names/descriptions in the prompt
+  [x] list_workflows / read_workflow tools (read-only; no script execution)
+  [x] /workflows and /wf <name> [text] commands
+
 Setup:
   pip install agno openai httpx python-dotenv sqlalchemy pymupdf python-docx openpyxl
   Put files in docs/<user_id>/  (default user: docs/demo-user/)
@@ -75,7 +85,9 @@ import base64
 import json
 import operator
 import os
+import re
 import uuid
+from typing import Optional
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -86,6 +98,7 @@ from agno.agent import Agent
 from agno.db.sqlite import SqliteDb
 from agno.memory import MemoryManager
 from agno.models.openai import OpenAIChat
+from agno.models.openai.like import OpenAILike
 from agno.models.openrouter import OpenRouter
 from agno.run.agent import RunEvent
 from agno.session.summary import SessionSummaryManager
@@ -102,11 +115,13 @@ dotenv.load_dotenv()  # BEFORE our modules: they read settings (.env) at import 
 
 from doc_tools import DOCS_ROOT, DOCUMENT_TOOLS  # STEP 4
 from search_index import ensure_indexed, search_documents  # STEP 8
+from workflows import WORKFLOW_TOOLS, format_workflow, get_workflow, load_workflows, workflows_block  # STEP 10
 from tool_guard import AUDIT_LOG, remember_tool_activity, tool_guard  # STEP 5
 from language import REFUSAL, detect_language, language_instruction  # language rule
 from doc_tools import documents_block  # STEP 6
 from spotlight import nonce_for, rules as untrusted_rules  # STEP 6
 from grounding import GROUNDING_MODE, correction_prompt, grounding_hook, pop_report  # STEP 7
+from planner import Plan, plan  # routing: chat / documents / overview
 
 dotenv.load_dotenv()
 
@@ -133,14 +148,30 @@ AgnoInstrumentor().instrument()
 # Model: the user picks one (Mike lets each user choose). Swap via MODEL env.
 # retries + exponential_backoff = automatic retry on rate limits / 5xx.
 # ---------------------------------------------------------------------------
-MODEL_ID = os.getenv("MODEL", "deepseek/deepseek-v4-flash")
+# With LITELLM_BASE_URL set, every chat-model call goes through the LiteLLM
+# proxy (litellm/config.yaml): MODEL / HOUSEKEEPING_MODEL are then its aliases
+# (sift-fast, sift-local, sift-strong) and the proxy does retries, fallbacks
+# and Langfuse logging. Without it, Sift calls OpenRouter and vLLM directly.
+LITELLM_BASE_URL = os.getenv("LITELLM_BASE_URL", "").strip()
+LITELLM_API_KEY = os.getenv("LITELLM_API_KEY") or "none"
 
-model = OpenRouter(
-    id=MODEL_ID,
-    max_tokens=8192,          # Agno default is 1024: too short for real answers
-    retries=2,
-    exponential_backoff=True,
-)
+
+def proxy_model(alias: str, **kwargs) -> OpenAILike:
+    """A chat model served by the LiteLLM proxy under one of its aliases."""
+    return OpenAILike(id=alias, base_url=LITELLM_BASE_URL, api_key=LITELLM_API_KEY, **kwargs)
+
+
+if LITELLM_BASE_URL:
+    MODEL_ID = os.getenv("MODEL", "sift-fast")
+    model = proxy_model(MODEL_ID, max_tokens=8192)  # retries/fallbacks happen in the proxy
+else:
+    MODEL_ID = os.getenv("MODEL", "deepseek/deepseek-v4-flash")
+    model = OpenRouter(
+        id=MODEL_ID,
+        max_tokens=8192,          # Agno default is 1024: too short for real answers
+        retries=2,
+        exponential_backoff=True,
+    )
 
 # ---------------------------------------------------------------------------
 # Storage: SQLite for dev. For production swap ONE line:
@@ -155,14 +186,18 @@ db = SqliteDb(db_file="agent.db")
 # model so they don't double the cost of every turn. Served by the local
 # vLLM endpoint (OPENAI_BASE_URL / OPENAI_API_KEY in .env), 16k context.
 # ---------------------------------------------------------------------------
-HOUSEKEEPING_MODEL_ID = os.getenv("HOUSEKEEPING_MODEL", "adept3o")
-housekeeping_model = OpenAIChat(
-    id=HOUSEKEEPING_MODEL_ID,
-    base_url=os.getenv("OPENAI_BASE_URL"),
-    api_key=os.getenv("OPENAI_API_KEY"),
-    max_tokens=2048,
-    retries=1,
-)
+if LITELLM_BASE_URL:
+    HOUSEKEEPING_MODEL_ID = os.getenv("HOUSEKEEPING_MODEL", "sift-local")
+    housekeeping_model = proxy_model(HOUSEKEEPING_MODEL_ID, max_tokens=2048)
+else:
+    HOUSEKEEPING_MODEL_ID = os.getenv("HOUSEKEEPING_MODEL", "adept3o")
+    housekeeping_model = OpenAIChat(
+        id=HOUSEKEEPING_MODEL_ID,
+        base_url=os.getenv("OPENAI_BASE_URL"),
+        api_key=os.getenv("OPENAI_API_KEY"),
+        max_tokens=2048,
+        retries=1,
+    )
 
 # Long-term memory = Mike's per-user memory note.
 # What to keep is the important part: stable preferences and facts about the
@@ -339,6 +374,16 @@ Documents (STEP 4 + 6 + 8):
   * Exact phrase/name/number -> find_in_document (doc_id "all" searches every file).
   * If one search finds nothing, try the other tool and other wording (synonyms,
     singular/plural, Arabic and English) BEFORE saying "not found".
+- Reading (STEP 9):
+  * Several small documents at once (compare, combine) -> fetch_documents.
+  * Spreadsheets (.xlsx/.csv) -> read_table_cells, not read_document: first call
+    without cell_range to see sheets and headers, then read the rows you need.
+    Cite cells as 'Sheet'!C7. Never shift a value to another row or column.
+
+Workflows (STEP 10):
+- AVAILABLE WORKFLOWS lists saved procedures. If the request matches one, call
+  read_workflow first and follow its steps; if the user selected a workflow,
+  its instructions are given to you in the context: follow them.
 - Before answering about a document's content, read it with read_document
   (once per document per answer), or use find_in_document for a specific term.
 - You do NOT keep document text between turns: read again in each new answer.
@@ -350,6 +395,8 @@ Documents (STEP 4 + 6 + 8):
   reading the whole document: less text, fewer mix-ups.
 - Every name, number and quote in your answer is automatically checked against
   THIS turn's tool results. Copy them exactly; never add names from memory.
+- If you are given search_hints (Arabic and English queries from the router),
+  you may use them as extra queries for search_documents. They are suggestions only.
 
 Previous turn (STEP 5):
 - session_state.previous_turn_tool_activity lists what tools did in the previous
@@ -369,6 +416,7 @@ def build_instructions(run_context) -> str:
     return "\n\n".join([
         INSTRUCTIONS,
         untrusted_rules(nonce_for(session_id)),   # same code for the whole chat
+        workflows_block(user_id),                 # STEP 10: names + descriptions
         documents_block(user_id, session_id),     # rebuilt each run: new files appear
     ])
 
@@ -383,6 +431,7 @@ agent = Agent(
         calculate,
         *DOCUMENT_TOOLS,                               # STEP 4: list/read/find
         search_documents,                              # STEP 8: search ALL docs
+        *WORKFLOW_TOOLS,                               # STEP 10: list/read_workflow
         save_note,                                     # STEP 3: needs approval
         UserFeedbackTools(),                           # STEP 3: ask_user (choices)
         UserControlFlowTools(add_instructions=False),  # STEP 3: get_user_input (text);
@@ -420,19 +469,147 @@ agent = Agent(
 
 
 # ---------------------------------------------------------------------------
+# Chat route (planner.py): a SMALL agent for small talk, weather, time and
+# maths. No document tools, no document list, short prompt, local model.
+# If the message needs documents it calls needs_documents() instead of
+# answering, and chat_turn re-runs the turn on the documents agent.
+# ---------------------------------------------------------------------------
+@tool(stop_after_tool_call=True)
+def needs_documents(reason: str) -> str:
+    """Hand this message to the documents assistant. Call it INSTEAD of answering
+    when the message is about the user's files, or about laws, regulations,
+    contracts, decisions, people, dates or numbers that would come from
+    documents. Also call it when you are not sure.
+
+    Args:
+        reason: A few words on why documents are needed.
+    """
+    return "Handed over to the documents assistant."
+
+
+CHAT_INSTRUCTIONS = """\
+You are Sift's chat assistant. You support Arabic and English only.
+Write your whole answer in the reply_language you are given.
+
+- You can NOT see the user's documents. If a message needs them, or is about
+  laws, regulations, contracts, government decisions, or names, dates and
+  numbers that would come from documents, call needs_documents and write
+  nothing else. When unsure, call needs_documents.
+- For weather, time or arithmetic use the tools; never guess.
+- Otherwise reply briefly and friendly: greetings, thanks, what you can do
+  (answer questions about the user's documents in Arabic and English), and
+  general knowledge clearly unrelated to the documents.
+"""
+
+if LITELLM_BASE_URL:
+    chat_model = proxy_model(os.getenv("CHAT_MODEL", "sift-local"), max_tokens=1024)
+else:
+    chat_model = housekeeping_model  # adept3o directly
+
+chat_agent = Agent(
+    name="Chat",
+    model=chat_model,
+    instructions=CHAT_INSTRUCTIONS,
+    tools=[get_weather, get_current_time, calculate, needs_documents],
+    markdown=True,
+    add_datetime_to_context=True,
+    tool_hooks=[tool_guard],        # same audit log as the documents agent
+    tool_call_limit=4,
+    db=db,                          # same session as the documents agent: one history
+    add_history_to_context=True,
+    num_history_runs=5,             # same window as the documents agent
+    max_tool_calls_from_history=0,
+    memory_manager=memory_manager,  # greets the user by name, saves preferences
+    update_memory_on_run=True,
+    add_memories_to_context=True,
+    add_session_summary_to_context=True,  # the documents agent maintains the summary
+)
+
+
+# ---------------------------------------------------------------------------
 # Streaming: map Agno events to what a UI would receive (Mike's SSE parts)
 # ---------------------------------------------------------------------------
 _last_language: dict = {}  # session_id -> "ar" | "en" (for messages with no letters)
+_last_route: dict = {}     # session_id -> last route (follow-ups stay on documents)
 
 
-async def chat_turn(text: str, user_id: str, session_id: str) -> None:
+def _recent_history(session_id: str, n: int = 4) -> list:
+    """Last n messages of this chat as 'user: ...' / 'assistant: ...' lines (planner input)."""
+    session = agent.get_session(session_id=session_id)
+    lines = []
+    for run in (session.runs if session else None) or []:
+        text = getattr(getattr(run, "input", None), "input_content", None)
+        if isinstance(text, str) and text:
+            lines.append(f"user: {text[:200]}")
+        if isinstance(run.content, str) and run.content:
+            lines.append(f"assistant: {run.content[:200]}")
+    return lines[-n:]
+
+
+def _file_names(user_id: str, session_id: str) -> list:
+    from agno.run import RunContext
+    from doc_tools import _list_docs
+    return [d.rel for d in _list_docs(RunContext(run_id="plan", session_id=session_id, user_id=user_id))]
+
+
+async def chat_once(text: str, user_id: str, session_id: str, deps: dict) -> Optional[str]:
+    """Run the chat agent. Returns None if it answered, or the needs_documents
+    reason if it handed over (its run is then removed from the chat history)."""
+    run = await chat_agent.arun(text, user_id=user_id, session_id=session_id,
+                                dependencies=deps, add_dependencies_to_context=True)
+    handover = next((t for t in (run.tools or []) if t.tool_name == "needs_documents"), None)
+    if handover is None:
+        for t in run.tools or []:
+            print(f"\n  [tool_start] {t.tool_name}({t.tool_args})\n  [tool_result] {str(t.result)[:120]}")
+        print(re.sub(r"<\|channel>.*?<channel\|>", "", run.content or "", flags=re.S).strip())  # Gemma thinking tags
+        return None
+    db.delete_run(run.run_id)  # the hand-over is not part of the conversation (runs are rows of their own)
+    return str((handover.tool_args or {}).get("reason", ""))[:60] or "unspecified"
+
+
+async def chat_turn(text: str, user_id: str, session_id: str, workflow: str = "",
+                    language_text: Optional[str] = None) -> None:
     # LANGUAGE: decided in code from THIS message (see language.py)
-    lang = detect_language(text) or _last_language.get(session_id, "en")
+    probe = text if language_text is None else language_text
+    lang = detect_language(probe) or _last_language.get(session_id, "en")
     if lang == "other":
         print(REFUSAL)  # fixed reply, no model call, not stored in history
         return
     _last_language[session_id] = lang
     deps = {"reply_language": language_instruction(lang)}
+    if workflow:  # STEP 10: the user picked a workflow explicitly (/wf name ...)
+        found = get_workflow(workflow, user_id)
+        if not found:
+            print(f"  No workflow '{workflow}'. Try /workflows")
+            return
+        deps["selected_workflow"] = format_workflow(*found)
+
+    # ROUTE (planner.py): chat / documents / overview. A selected workflow is
+    # always a documents turn.
+    if workflow:
+        route = Plan("documents", "workflow:" + workflow, "rules")
+    else:
+        route = await asyncio.to_thread(
+            plan, text, _recent_history(session_id),
+            _file_names(user_id, session_id), _last_route.get(session_id))
+    print(f"\n  [route] {route.route} ({route.reason}, {route.ms} ms)")
+
+    if route.route == "overview":
+        _last_route[session_id] = "overview"
+        from agno.run import RunContext
+        from doc_tools import list_documents
+        print(list_documents(RunContext(run_id="overview", session_id=session_id, user_id=user_id)))
+        return
+    if route.route == "chat":
+        reason = await chat_once(text, user_id, session_id, deps)
+        if reason is None:            # answered by the chat agent
+            _last_route[session_id] = "chat"
+            return
+        route = Plan("documents", f"escalated_from_chat:{reason}", "chat")
+        print(f"  [route] documents ({route.reason})")
+    _last_route[session_id] = "documents"
+    if route.queries:
+        deps["search_hints"] = route.queries
 
     # STEP 8: index new/changed files before the run (cheap when nothing changed).
     # In a server this belongs in the upload pipeline instead.
@@ -584,7 +761,7 @@ async def main() -> None:
     session_id = os.getenv("SESSION_ID") or str(uuid.uuid4())
     print(f"model={MODEL_ID} user={user_id} session={session_id}")
     print(f"Documents folder: {DOCS_ROOT / user_id}")
-    print("Commands: /memories  /summary  /docs  /reindex  /activity  /audit  /new   (Ctrl+C to quit)\n")
+    print("Commands: /memories  /summary  /docs  /reindex  /workflows  /wf <name> [text]  /activity  /audit  /new\n")
     while True:
         try:
             text = input("You: ").strip()
@@ -596,6 +773,17 @@ async def main() -> None:
             await show_memories(user_id)
         elif text == "/summary":
             await show_summary(session_id)
+        elif text == "/workflows":  # STEP 10
+            wfs = load_workflows(user_id)
+            print("\n".join(f"  {n} ({sc}): {sk.description[:100]}" for n, (sk, sc) in sorted(wfs.items()))
+                  or "  (no workflows; add folders with SKILL.md under workflows/)")
+        elif text.startswith("/wf "):  # STEP 10: /wf <name> [extra request]
+            parts = text.split(maxsplit=2)
+            name = parts[1] if len(parts) > 1 else ""
+            extra = parts[2] if len(parts) > 2 else ""
+            print("AI: ", end="")
+            await chat_turn(extra or f"Run the workflow {name}.", user_id, session_id,
+                            workflow=name, language_text=extra)  # no extra text -> keep chat language
         elif text == "/reindex":  # STEP 8: (re)index changed files now
             stats = await asyncio.to_thread(ensure_indexed, user_id, lambda m: print(f"  [index] {m}"))
             print(f"  {stats}")
@@ -621,7 +809,7 @@ async def main() -> None:
             except FileNotFoundError:
                 print("  (no tool calls yet)")
         elif text.startswith("/"):  # typo like "/memory": don't send to the model
-            print("  Unknown command. Try /memories /summary /docs /reindex /activity /audit /new")
+            print("  Unknown command. Try /memories /summary /docs /reindex /workflows /wf /activity /audit /new")
         else:
             print("AI: ", end="")
             await chat_turn(text, user_id, session_id)

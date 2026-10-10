@@ -61,7 +61,7 @@ CONCEPTS = [
 ]
 
 
-def fake_embed(texts):
+def fake_embed(texts, task=""):
     out = []
     for t in texts:
         toks = set(si.keyword_tokens(t)) | set(t.lower().split())

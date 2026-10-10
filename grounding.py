@@ -31,7 +31,8 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 GROUNDING_MODE = os.getenv("GROUNDING_MODE", "retry")  # retry | warn | off
-DOC_TOOLS = {"read_document", "find_in_document", "search_documents"}  # + step 8
+DOC_TOOLS = {"read_document", "find_in_document", "search_documents",  # + step 8
+             "fetch_documents", "read_table_cells"}                      # + step 9
 EVIDENCE_TOOLS = DOC_TOOLS | {"calculate", "get_current_time", "get_weather", "list_documents"}
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,934 @@
+From f4c49eb7ec420eb1163efc812dd3978316caf9a1 Mon Sep 17 00:00:00 2001
+From: ahmedalbahnasawy92 <ahmed.albahnasawy@saal.ai>
+Date: Fri, 9 Oct 2026 12:11:46 +0400
+Subject: [PATCH] Steps 9-10: fetch_documents, read_table_cells, workflows
+
+Step 9 (complete Mike's read tools):
+- fetch_documents: read several documents in one call with a shared size
+  budget; tool guard skips docs already read and marks fetched ones as read
+- read_table_cells: xlsx/csv as a table with column letters and real row
+  numbers, sheet selection (Arabic names), Excel ranges (A1:F50, B:B, 3:20),
+  header row always shown, paging, cell cap, values instead of formulas
+- both count as evidence for the grounding check
+
+Step 10 (workflows = saved prompt templates):
+- workflows.py: SKILL.md folders parsed and validated with Agno's
+  LocalSkills; shared + per-user (user overrides shared); read-only
+  list_workflows / read_workflow tools (no script execution)
+- AVAILABLE WORKFLOWS (names + descriptions) in the system prompt;
+  /workflows and /wf <name> [text] to run one explicitly
+- sample workflows: gazette-appointments, document-brief, compare-documents
+- tests/test_step9_10.py
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Pr6CTTM5Nqv9ihGiKHnj2d
+---
+ .env.example                                  |   5 +
+ README.md                                     |  28 ++-
+ agno_agent.py                                 |  51 +++++-
+ doc_tools.py                                  | 173 ++++++++++++++++--
+ grounding.py                                  |   3 +-
+ tests/test_step9_10.py                        | 161 ++++++++++++++++
+ tool_guard.py                                 |  32 +++-
+ workflows.py                                  | 127 +++++++++++++
+ workflows/shared/compare-documents/SKILL.md   |  22 +++
+ workflows/shared/document-brief/SKILL.md      |  23 +++
+ .../shared/gazette-appointments/SKILL.md      |  32 ++++
+ workflows/users/.gitkeep                      |   0
+ 12 files changed, 633 insertions(+), 24 deletions(-)
+ create mode 100644 tests/test_step9_10.py
+ create mode 100644 workflows.py
+ create mode 100644 workflows/shared/compare-documents/SKILL.md
+ create mode 100644 workflows/shared/document-brief/SKILL.md
+ create mode 100644 workflows/shared/gazette-appointments/SKILL.md
+ create mode 100644 workflows/users/.gitkeep
+
+diff --git a/.env.example b/.env.example
+index 38b01d9..856afb6 100644
+--- a/.env.example
++++ b/.env.example
+@@ -25,3 +25,8 @@ EMBEDDING_DIM=1024
+ # EMBEDDING_BASE_URL=http://localhost:8001/v1
+ # One-line document summaries (defaults to HOUSEKEEPING_MODEL; none -> first line of the file)
+ # SUMMARY_MODEL=
++
++# Steps 9-10
++# MAX_FETCH_DOCS=10          # fetch_documents: max documents per call
++# MAX_TABLE_CELLS=4000       # read_table_cells: max cells per call
++# WORKFLOWS_DIR=workflows    # shared/ and users/<user_id>/ workflow folders
+diff --git a/README.md b/README.md
+index ea58798..890ac71 100644
+--- a/README.md
++++ b/README.md
+@@ -19,6 +19,8 @@ keeps it grounded, safe and cheap.
+ | 6 | Document list in the system prompt; untrusted text fenced with a per-chat code (prompt-injection defence) | `spotlight.py`, `doc_tools.py` |
+ | 7 | Grounding check: names, numbers, quotes and citations in each answer verified against this turn's tool results (Arabic-aware); one automatic correction if something isn't found | `grounding.py` |
+ | 8 | Search across all documents: `search_documents` (hybrid pgvector + Arabic-stemmed keywords, RRF), `find_in_document("all", ...)` with Arabic-tolerant matching, one-line summary per file in the documents list | `search_index.py`, `doc_tools.py` |
++| 9 | `fetch_documents` (several docs in one call, shared size budget) and `read_table_cells` (xlsx/csv with sheets, ranges and cell coordinates) | `doc_tools.py` |
++| 10 | Workflows: saved step-by-step procedures as `SKILL.md` folders (Agno `LocalSkills` loader), shared + per-user, `list_workflows` / `read_workflow`, `/wf` command | `workflows.py`, `workflows/` |
+ | – | Reply language decided in code: Arabic or English, other languages refused | `language.py` |
+ 
+ ## Quick start
+@@ -31,7 +33,7 @@ mkdir -p docs/demo-user       # put PDF / DOCX / XLSX / TXT files here
+ python agno_agent.py
+ ```
+ 
+-Chat commands: `/docs` `/reindex` `/memories` `/summary` `/activity` `/audit` `/new`
++Chat commands: `/docs` `/reindex` `/workflows` `/wf <name> [text]` `/memories` `/summary` `/activity` `/audit` `/new`
+ 
+ ### Search index (step 8)
+ 
+@@ -47,6 +49,27 @@ python search_index.py demo-user           # index now (also happens automatical
+ python search_index.py demo-user --force   # rebuild after changing embedding/summary model
+ ```
+ 
++### Workflows (step 10)
++
++A workflow is a folder with a `SKILL.md` (Agent Skills format):
++
++```
++workflows/shared/<name>/SKILL.md        # for everyone
++workflows/users/<user_id>/<name>/SKILL.md  # one user's own (overrides a shared one with the same name)
++```
++
++```markdown
++---
++name: gazette-appointments            # lowercase + hyphens, same as the folder name
++description: When to use it, in one line (quote it if it contains ": ")
++---
++1. Step one ...
++```
++
++The agent sees names and descriptions, loads the steps with `read_workflow` when a request matches,
++or you run one directly: `/wf gazette-appointments العدد 790`.
++Included: `gazette-appointments`, `document-brief`, `compare-documents`.
++
+ ## Tests (offline, no API key)
+ 
+ ```bash
+@@ -55,6 +78,7 @@ python tests/test_step6.py
+ python tests/test_step7.py
+ python tests/test_step8.py                       # local SQLite index
+ VECTOR_DB_URL=postgresql://... python tests/test_step8.py   # against pgvector
++python tests/test_step9_10.py
+ ```
+ 
+ ## Layout
+@@ -66,6 +90,8 @@ tool_guard.py     tool_hooks guard + post-hook tool-activity note
+ spotlight.py      untrusted-text fencing (nonce per chat)
+ grounding.py      answer-vs-evidence check (step 7)
+ search_index.py   chunking, embeddings, pgvector/SQLite index, search_documents, summaries (step 8)
++workflows.py      saved workflows: loader, prompt block, list/read tools (step 10)
++workflows/        shared/ and users/<user_id>/ workflow folders
+ language.py       reply-language detection
+ tests/            offline tests
+ examples/         router_agno.py (router + specialists example)
+diff --git a/agno_agent.py b/agno_agent.py
+index ddf15a6..c1d78cb 100644
+--- a/agno_agent.py
++++ b/agno_agent.py
+@@ -60,6 +60,16 @@ STEP 8: search across all documents + one-line summaries (search_index.py).
+   [x] One-line summary per file in AVAILABLE DOCUMENTS (housekeeping model)
+   [x] Files indexed automatically when new/changed; /reindex command
+ 
++STEP 9: complete Mike's read tools (doc_tools.py).
++  [x] fetch_documents: several documents in one call (shared size budget)
++  [x] read_table_cells: xlsx/csv with cell coordinates, sheets, ranges
++
++STEP 10: workflows = saved prompt templates (workflows.py, workflows/).
++  [x] SKILL.md folders, parsed/validated by Agno's LocalSkills
++  [x] shared + per-user workflows; names/descriptions in the prompt
++  [x] list_workflows / read_workflow tools (read-only; no script execution)
++  [x] /workflows and /wf <name> [text] commands
++
+ Setup:
+   pip install agno openai httpx python-dotenv sqlalchemy pymupdf python-docx openpyxl
+   Put files in docs/<user_id>/  (default user: docs/demo-user/)
+@@ -76,6 +86,7 @@ import json
+ import operator
+ import os
+ import uuid
++from typing import Optional
+ from datetime import datetime
+ from pathlib import Path
+ from zoneinfo import ZoneInfo
+@@ -102,6 +113,7 @@ dotenv.load_dotenv()  # BEFORE our modules: they read settings (.env) at import
+ 
+ from doc_tools import DOCS_ROOT, DOCUMENT_TOOLS  # STEP 4
+ from search_index import ensure_indexed, search_documents  # STEP 8
++from workflows import WORKFLOW_TOOLS, format_workflow, get_workflow, load_workflows, workflows_block  # STEP 10
+ from tool_guard import AUDIT_LOG, remember_tool_activity, tool_guard  # STEP 5
+ from language import REFUSAL, detect_language, language_instruction  # language rule
+ from doc_tools import documents_block  # STEP 6
+@@ -339,6 +351,16 @@ Documents (STEP 4 + 6 + 8):
+   * Exact phrase/name/number -> find_in_document (doc_id "all" searches every file).
+   * If one search finds nothing, try the other tool and other wording (synonyms,
+     singular/plural, Arabic and English) BEFORE saying "not found".
++- Reading (STEP 9):
++  * Several small documents at once (compare, combine) -> fetch_documents.
++  * Spreadsheets (.xlsx/.csv) -> read_table_cells, not read_document: first call
++    without cell_range to see sheets and headers, then read the rows you need.
++    Cite cells as 'Sheet'!C7. Never shift a value to another row or column.
++
++Workflows (STEP 10):
++- AVAILABLE WORKFLOWS lists saved procedures. If the request matches one, call
++  read_workflow first and follow its steps; if the user selected a workflow,
++  its instructions are given to you in the context: follow them.
+ - Before answering about a document's content, read it with read_document
+   (once per document per answer), or use find_in_document for a specific term.
+ - You do NOT keep document text between turns: read again in each new answer.
+@@ -369,6 +391,7 @@ def build_instructions(run_context) -> str:
+     return "\n\n".join([
+         INSTRUCTIONS,
+         untrusted_rules(nonce_for(session_id)),   # same code for the whole chat
++        workflows_block(user_id),                 # STEP 10: names + descriptions
+         documents_block(user_id, session_id),     # rebuilt each run: new files appear
+     ])
+ 
+@@ -383,6 +406,7 @@ agent = Agent(
+         calculate,
+         *DOCUMENT_TOOLS,                               # STEP 4: list/read/find
+         search_documents,                              # STEP 8: search ALL docs
++        *WORKFLOW_TOOLS,                               # STEP 10: list/read_workflow
+         save_note,                                     # STEP 3: needs approval
+         UserFeedbackTools(),                           # STEP 3: ask_user (choices)
+         UserControlFlowTools(add_instructions=False),  # STEP 3: get_user_input (text);
+@@ -425,14 +449,22 @@ agent = Agent(
+ _last_language: dict = {}  # session_id -> "ar" | "en" (for messages with no letters)
+ 
+ 
+-async def chat_turn(text: str, user_id: str, session_id: str) -> None:
++async def chat_turn(text: str, user_id: str, session_id: str, workflow: str = "",
++                    language_text: Optional[str] = None) -> None:
+     # LANGUAGE: decided in code from THIS message (see language.py)
+-    lang = detect_language(text) or _last_language.get(session_id, "en")
++    probe = text if language_text is None else language_text
++    lang = detect_language(probe) or _last_language.get(session_id, "en")
+     if lang == "other":
+         print(REFUSAL)  # fixed reply, no model call, not stored in history
+         return
+     _last_language[session_id] = lang
+     deps = {"reply_language": language_instruction(lang)}
++    if workflow:  # STEP 10: the user picked a workflow explicitly (/wf name ...)
++        found = get_workflow(workflow, user_id)
++        if not found:
++            print(f"  No workflow '{workflow}'. Try /workflows")
++            return
++        deps["selected_workflow"] = format_workflow(*found)
+ 
+     # STEP 8: index new/changed files before the run (cheap when nothing changed).
+     # In a server this belongs in the upload pipeline instead.
+@@ -584,7 +616,7 @@ async def main() -> None:
+     session_id = os.getenv("SESSION_ID") or str(uuid.uuid4())
+     print(f"model={MODEL_ID} user={user_id} session={session_id}")
+     print(f"Documents folder: {DOCS_ROOT / user_id}")
+-    print("Commands: /memories  /summary  /docs  /reindex  /activity  /audit  /new   (Ctrl+C to quit)\n")
++    print("Commands: /memories  /summary  /docs  /reindex  /workflows  /wf <name> [text]  /activity  /audit  /new\n")
+     while True:
+         try:
+             text = input("You: ").strip()
+@@ -596,6 +628,17 @@ async def main() -> None:
+             await show_memories(user_id)
+         elif text == "/summary":
+             await show_summary(session_id)
++        elif text == "/workflows":  # STEP 10
++            wfs = load_workflows(user_id)
++            print("\n".join(f"  {n} ({sc}): {sk.description[:100]}" for n, (sk, sc) in sorted(wfs.items()))
++                  or "  (no workflows; add folders with SKILL.md under workflows/)")
++        elif text.startswith("/wf "):  # STEP 10: /wf <name> [extra request]
++            parts = text.split(maxsplit=2)
++            name = parts[1] if len(parts) > 1 else ""
++            extra = parts[2] if len(parts) > 2 else ""
++            print("AI: ", end="")
++            await chat_turn(extra or f"Run the workflow {name}.", user_id, session_id,
++                            workflow=name, language_text=extra)  # no extra text -> keep chat language
+         elif text == "/reindex":  # STEP 8: (re)index changed files now
+             stats = await asyncio.to_thread(ensure_indexed, user_id, lambda m: print(f"  [index] {m}"))
+             print(f"  {stats}")
+@@ -621,7 +664,7 @@ async def main() -> None:
+             except FileNotFoundError:
+                 print("  (no tool calls yet)")
+         elif text.startswith("/"):  # typo like "/memory": don't send to the model
+-            print("  Unknown command. Try /memories /summary /docs /reindex /activity /audit /new")
++            print("  Unknown command. Try /memories /summary /docs /reindex /workflows /wf /activity /audit /new")
+         else:
+             print("AI: ", end="")
+             await chat_turn(text, user_id, session_id)
+diff --git a/doc_tools.py b/doc_tools.py
+index a7c65e7..6ea5c9b 100644
+--- a/doc_tools.py
++++ b/doc_tools.py
+@@ -206,12 +206,37 @@ def documents_block(user_id: str, session_id: str, limit: int = 50) -> str:
+     return "\n".join(lines)
+ 
+ 
++def _read_one(doc: Doc, n: str, limit: int) -> str:
++    """Header + fenced text of one document, cut at `limit` characters."""
++    name = fence_inline(doc.rel, n)
++    try:
++        pages = _pages(doc)
++    except Exception as e:
++        return f"Could not read {name}: {e}"
++
++    text, starts = _render(pages)
++    if not any(t.strip() for _, t in pages):
++        return (f"{name} has no extractable text. It may be a scanned PDF "
++                "(OCR is not supported yet). Tell the user.")
++
++    header = f"Document {doc.doc_id}: {name} ({len(pages)} section(s), {len(text):,} chars)\n\n"
++    note = ""
++    if len(text) > limit:
++        last = _label_at(starts, limit)
++        note = (f"\n\n[TRUNCATED at {limit:,} of {len(text):,} chars, in {last}. "
++                "Use find_in_document to look for specific terms in the rest.]")
++        text = text[:limit]
++    # STEP 6: the body is untrusted data; our notes stay OUTSIDE the fence
++    return header + fence(text, n, source=f"{doc.doc_id}") + note
++
++
+ def read_document(doc_id: str, run_context: RunContext) -> str:
+     """Read the full text of one document, with [Page N] markers.
+     Call this before answering questions about, summarising or quoting a
+     document. Read each document at most ONCE per answer; after that use the
+     text you already have, or find_in_document for a specific phrase.
+     For very large documents the text is cut off: use find_in_document then.
++    For spreadsheets, prefer read_table_cells (keeps rows, columns and cell refs).
+ 
+     Args:
+         doc_id: The handle from list_documents, e.g. "doc-1a2b3c".
+@@ -219,27 +244,141 @@ def read_document(doc_id: str, run_context: RunContext) -> str:
+     doc = _resolve(doc_id, run_context)
+     if not doc:
+         return _not_found(doc_id)
++    return _read_one(doc, nonce_for(run_context.session_id), MAX_READ_CHARS)
++
++
++# ---------------------------------------------------------------------------
++# STEP 9: read several documents at once (Mike's fetch_documents)
++# ---------------------------------------------------------------------------
++MAX_FETCH_DOCS = int(os.getenv("MAX_FETCH_DOCS", "10"))
++
++
++def fetch_documents(doc_ids: str, run_context: RunContext) -> str:
++    """Read SEVERAL documents in one call (e.g. to compare them or answer a
++    question that spans them). The total size is capped and shared between the
++    documents, so use it for small/medium files; for one large document use
++    read_document, and for a specific term use find_in_document or
++    search_documents. Documents already read in this answer are skipped.
++
++    Args:
++        doc_ids: Comma-separated handles, e.g. "doc-1a2b3c, doc-4d5e6f" (max 10).
++    """
++    ids = [d.strip() for d in doc_ids.split(",") if d.strip()]
++    if not ids:
++        return "No doc_ids given. Pass comma-separated handles from the documents list."
++    ids = list(dict.fromkeys(ids))[:MAX_FETCH_DOCS]  # dedupe, keep order
++    n = nonce_for(run_context.session_id)
++    per_doc = max(5_000, MAX_READ_CHARS // len(ids))  # share the budget
++    parts, missing = [], []
++    for doc_id in ids:
++        doc = _resolve(doc_id, run_context)
++        if not doc:
++            missing.append(doc_id)
++            continue
++        parts.append(_read_one(doc, n, per_doc))
++    if missing:
++        parts.append(f"Not found: {', '.join(missing)}. Use the doc_ids from the documents list.")
++    header = f"{len(ids) - len(missing)} document(s), up to {per_doc:,} chars each:\n\n"
++    return header + "\n\n---\n\n".join(parts)
++
++
++# ---------------------------------------------------------------------------
++# STEP 9: spreadsheet cells with coordinates (Mike's read_table_cells)
++# ---------------------------------------------------------------------------
++TABLE_TYPES = {".xlsx", ".csv"}
++MAX_TABLE_CELLS = int(os.getenv("MAX_TABLE_CELLS", "4000"))
++
++
++def _load_rows(doc: Doc, sheet: str) -> Tuple[str, List[str], List[List[str]]]:
++    """Returns (sheet_name, all_sheet_names, rows as lists of strings)."""
++    if doc.path.suffix.lower() == ".csv":
++        import csv
++        with open(doc.path, newline="", encoding="utf-8", errors="replace") as f:
++            rows = [[c for c in r] for r in csv.reader(f)]
++        return "csv", ["csv"], rows
++    import openpyxl
++    wb = openpyxl.load_workbook(doc.path, read_only=True, data_only=True)  # values, not formulas
++    names = wb.sheetnames
++    if sheet:
++        match = next((s for s in names if s.lower() == sheet.lower()), None)
++        if match is None:
++            raise KeyError(f"No sheet '{sheet}'. Sheets: {', '.join(names)}")
++        ws = wb[match]
++    else:
++        ws = wb[names[0]]
++    rows = [["" if v is None else str(v) for v in r] for r in ws.iter_rows(values_only=True)]
++    return ws.title, names, rows
++
++
++def _parse_range(cell_range: str) -> Tuple[int, int, int, int]:
++    """'B2:D10' -> (row1, col1, row2, col2), 1-based. '' -> whole sheet."""
++    from openpyxl.utils.cell import range_boundaries
++    min_col, min_row, max_col, max_row = range_boundaries(cell_range.upper().replace("$", ""))
++    return min_row or 1, min_col or 1, max_row or 10**9, max_col or 10**9
++
++
++def read_table_cells(
++    doc_id: str,
++    run_context: RunContext,
++    sheet: str = "",
++    cell_range: str = "",
++    max_rows: int = 100,
++) -> str:
++    """Read a spreadsheet (xlsx or csv) as a table WITH cell coordinates, so
++    you can cite exact cells (e.g. Budget!C7). Call first without cell_range to
++    see the sheets, size and header row; then read the rows you need.
++    Use this instead of read_document for spreadsheets: numbers stay in their
++    columns, so you don't mix up rows.
++
++    Args:
++        doc_id: Handle of an .xlsx or .csv document.
++        sheet: Sheet name (default: the first sheet).
++        cell_range: Excel range like "A1:F50", "B:B" or "3:20" (default: from the top).
++        max_rows: Maximum rows to return (default 100, max 500).
++    """
++    doc = _resolve(doc_id, run_context)
++    if not doc:
++        return _not_found(doc_id)
++    if doc.path.suffix.lower() not in TABLE_TYPES:
++        return f"{doc.doc_id} is not a spreadsheet (.xlsx/.csv). Use read_document instead."
+     n = nonce_for(run_context.session_id)
+-    name = fence_inline(doc.rel, n)
+     try:
+-        pages = _pages(doc)
++        title, names, rows = _load_rows(doc, sheet)
+     except Exception as e:
+-        return f"Could not read {name}: {e}"
++        return f"Could not read the table: {e}"
++    from openpyxl.utils import get_column_letter
+ 
+-    text, starts = _render(pages)
+-    if not any(t.strip() for _, t in pages):
+-        return (f"{name} has no extractable text. It may be a scanned PDF "
+-                "(OCR is not supported yet). Tell the user.")
++    n_rows = len(rows)
++    n_cols = max((len(r) for r in rows), default=0)
++    overview = (f"{doc.doc_id} ({fence_inline(doc.rel, n)}): sheets {names}; "
++                f"sheet '{title}' has {n_rows} rows x {n_cols} columns "
++                f"(A1:{get_column_letter(max(n_cols, 1))}{max(n_rows, 1)}).")
++    if not rows:
++        return overview + " The sheet is empty."
+ 
+-    header = f"Document {doc.doc_id}: {name} ({len(pages)} section(s), {len(text):,} chars)\n\n"
+-    note = ""
+-    if len(text) > MAX_READ_CHARS:
+-        last = _label_at(starts, MAX_READ_CHARS)
+-        note = (f"\n\n[TRUNCATED at {MAX_READ_CHARS:,} of {len(text):,} chars, in {last}. "
+-                "Use find_in_document to look for specific terms in the rest.]")
+-        text = text[:MAX_READ_CHARS]
+-    # STEP 6: the body is untrusted data; our notes stay OUTSIDE the fence
+-    return header + fence(text, n, source=f"{doc.doc_id}") + note
++    try:
++        r1, c1, r2, c2 = _parse_range(cell_range) if cell_range.strip() else (1, 1, n_rows, n_cols)
++    except Exception:
++        return overview + f' Invalid cell_range "{cell_range}". Use e.g. "A1:F50", "B:B" or "3:20".'
++    r2, c2 = min(r2, n_rows), min(c2, n_cols)
++    max_rows = max(1, min(max_rows, 500))
++    max_rows = min(max_rows, max(1, MAX_TABLE_CELLS // max(1, c2 - c1 + 1)))  # cap total cells
++    last = min(r2, r1 + max_rows - 1)
++
++    cols = [get_column_letter(c) for c in range(c1, c2 + 1)]
++    lines = ["row | " + " | ".join(cols)]
++    if r1 > 1:  # always show the header row for context
++        header = rows[0] + [""] * n_cols
++        lines.append("1 | " + " | ".join(header[c1 - 1:c2]) + "   (header)")
++    for r in range(r1, last + 1):
++        row = rows[r - 1] + [""] * n_cols
++        lines.append(f"{r} | " + " | ".join(" ".join(v.split()) for v in row[c1 - 1:c2]))
++    shown = f"rows {r1}-{last}, columns {cols[0]}-{cols[-1]}"
++    more = ""
++    if last < r2:
++        more = f"\n[{r2 - last} more row(s) in this range: call again with cell_range starting at row {last + 1}.]"
++    return (overview + f"\nShowing {shown}. Cite cells as '{title}'!<column><row>.\n" +
++            fence("\n".join(lines), n, source=doc.doc_id) + more)
+ 
+ 
+ # STEP 8: Arabic-tolerant matching. Each character is mapped 1:1 (or dropped,
+@@ -341,4 +480,4 @@ def find_in_document(
+     return header + "\n" + fence("\n".join(blocks), n, source="find_in_document") + more
+ 
+ 
+-DOCUMENT_TOOLS = [list_documents, read_document, find_in_document]  # + search_documents (search_index.py)
++DOCUMENT_TOOLS = [list_documents, read_document, find_in_document, fetch_documents, read_table_cells]  # + search_documents (search_index.py)
+diff --git a/grounding.py b/grounding.py
+index 1024a30..77e6b72 100644
+--- a/grounding.py
++++ b/grounding.py
+@@ -31,7 +31,8 @@ from dataclasses import dataclass, field
+ from typing import Dict, List, Optional
+ 
+ GROUNDING_MODE = os.getenv("GROUNDING_MODE", "retry")  # retry | warn | off
+-DOC_TOOLS = {"read_document", "find_in_document", "search_documents"}  # + step 8
++DOC_TOOLS = {"read_document", "find_in_document", "search_documents",  # + step 8
++             "fetch_documents", "read_table_cells"}                      # + step 9
+ EVIDENCE_TOOLS = DOC_TOOLS | {"calculate", "get_current_time", "get_weather", "list_documents"}
+ 
+ # ---------------------------------------------------------------------------
+diff --git a/tests/test_step9_10.py b/tests/test_step9_10.py
+new file mode 100644
+index 0000000..6355b57
+--- /dev/null
++++ b/tests/test_step9_10.py
+@@ -0,0 +1,161 @@
++"""
++test_step9_10.py: offline tests for fetch_documents, read_table_cells (step 9)
++and workflows (step 10). No LLM or API key.
++
++Run:  python tests/test_step9_10.py
++"""
++
++import asyncio
++import os
++import sys
++import tempfile
++from pathlib import Path
++
++sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # repo root
++
++TMP = Path(tempfile.mkdtemp(prefix="step9_"))
++os.environ["DOCS_ROOT"] = str(TMP / "docs")
++os.environ["DOC_CACHE_DIR"] = str(TMP / "cache")
++os.environ["SPOTLIGHT_SECRET_FILE"] = str(TMP / "secret")
++os.environ["AUDIT_LOG"] = str(TMP / "audit.log")
++os.environ["WORKFLOWS_DIR"] = str(TMP / "workflows")
++os.environ["MAX_READ_CHARS"] = "20000"
++
++U1 = TMP / "docs" / "u1"
++U1.mkdir(parents=True)
++(U1 / "a.txt").write_text("Contract A: fee AED 50,000. " + "x" * 100)
++(U1 / "b.txt").write_text("Contract B: fee AED 65,000.")
++(U1 / "big.txt").write_text("BIG " * 20000)
++
++import openpyxl  # noqa: E402
++
++wb = openpyxl.Workbook()
++ws = wb.active
++ws.title = "Budget"
++ws.append(["Item", "Q1", "Q2", "Total"])
++for i in range(1, 151):
++    ws.append([f"Item {i}", i * 10, i * 20, None])
++ws["D2"] = "=B2+C2"                      # formula: we must get the VALUE, not the text
++wb.create_sheet("الموظفون").append(["الاسم", "الإدارة"])
++wb["الموظفون"].append(["سالم راشد", "الموارد البشرية"])
++wb.save(U1 / "budget.xlsx")
++(U1 / "staff.csv").write_text("name,dept\nSalem,HR\nFatima,Finance\n")
++
++# workflows: one shared, one user override, one invalid
++for scope, name, desc in [("shared", "document-brief", "Shared brief."),
++                          ("shared", "gazette-appointments", "List appointments."),
++                          ("users/u1", "document-brief", "MY brief, overrides shared."),
++                          ("shared", "Bad_Name", "Invalid because the name is uppercase.")]:
++    d = TMP / "workflows" / scope / name
++    d.mkdir(parents=True)
++    (d / "SKILL.md").write_text(f"---\nname: {name}\ndescription: {desc}\n---\n\n1. Step one for {name}.\n")
++
++from agno.run import RunContext  # noqa: E402
++
++import doc_tools as d  # noqa: E402
++import tool_guard as g  # noqa: E402
++import workflows as w  # noqa: E402
++
++CTX = RunContext(run_id="r1", session_id="s", user_id="u1")
++CTX2 = RunContext(run_id="r1", session_id="s", user_id="u2")
++
++
++def h(name):
++    return next(x.doc_id for x in d._list_docs(CTX) if x.path.name == name)
++
++
++def guarded(name, fn, args, ctx):
++    async def call(**kw):
++        return fn(**kw)
++    return asyncio.run(g.tool_guard(name, call, {**args, "run_context": ctx}, ctx))
++
++
++# ---------------------------------------------------------------- step 9
++def test_1_fetch_several_documents():
++    out = d.fetch_documents(f"{h('a.txt')}, {h('b.txt')}, doc-nope", CTX)
++    assert "50,000" in out and "65,000" in out and "Not found: doc-nope" in out
++    assert out.count("<<UNTRUSTED") >= 4  # names + bodies fenced
++    print("1. fetch_documents reads several docs, reports missing ones    OK")
++
++
++def test_2_fetch_shares_the_budget():
++    out = d.fetch_documents(f"{h('big.txt')}, {h('a.txt')}", CTX)
++    assert "TRUNCATED at 10,000" in out and "50,000" in out
++    print("2. size budget shared between docs (big one truncated)        OK")
++
++
++def test_3_fetch_and_read_dedupe_in_guard():
++    ctx = RunContext(run_id="r-dedupe", session_id="s", user_id="u1")
++    guarded("read_document", d.read_document, {"doc_id": h("a.txt")}, ctx)
++    out = guarded("fetch_documents", d.fetch_documents, {"doc_ids": f"{h('a.txt')}, {h('b.txt')}"}, ctx)
++    assert out.startswith("[Skipped, already read") and "65,000" in out and "50,000" not in out
++    again = guarded("read_document", d.read_document, {"doc_id": h("b.txt")}, ctx)
++    assert again == g.ALREADY_READ
++    print("3. fetch skips docs already read; later re-read is blocked      OK")
++
++
++def test_4_table_overview_and_header():
++    out = d.read_table_cells(h("budget.xlsx"), CTX)
++    assert "sheets ['Budget', 'الموظفون']" in out and "151 rows x 4 columns" in out
++    assert "row | A | B | C | D" in out and "1 | Item | Q1 | Q2 | Total" in out
++    print("4. overview: sheets, size, header row, column letters          OK")
++
++
++def test_5_range_keeps_header_and_coordinates():
++    out = d.read_table_cells(h("budget.xlsx"), CTX, cell_range="A50:C52")
++    assert "1 | Item | Q1 | Q2   (header)" in out
++    assert "50 | Item 49 | 490 | 980" in out and "52 | Item 51 | 510 | 1020" in out
++    assert "Cite cells as 'Budget'!" in out
++    print("5. range A50:C52 with header row and real row numbers          OK")
++
++
++def test_6_paging_and_formula_values():
++    out = d.read_table_cells(h("budget.xlsx"), CTX, max_rows=10)
++    assert "more row(s) in this range: call again with cell_range starting at row 11" in out
++    v = d.read_table_cells(h("budget.xlsx"), CTX, cell_range="D2:D2")
++    assert "=B2+C2" not in v  # we show values (openpyxl data_only), never formula text
++    print("6. long ranges are paged; formulas shown as values, not text   OK")
++
++
++def test_7_arabic_sheet_csv_and_errors():
++    ar = d.read_table_cells(h("budget.xlsx"), CTX, sheet="الموظفون")
++    assert "سالم راشد" in ar and "الموارد البشرية" in ar
++    csv = d.read_table_cells(h("staff.csv"), CTX, cell_range="A2:B3")
++    assert "2 | Salem | HR" in csv and "3 | Fatima | Finance" in csv
++    assert "is not a spreadsheet" in d.read_table_cells(h("a.txt"), CTX)
++    assert "No sheet 'Nope'" in d.read_table_cells(h("budget.xlsx"), CTX, sheet="Nope")
++    assert "Invalid cell_range" in d.read_table_cells(h("budget.xlsx"), CTX, cell_range="zz-top")
++    print("7. Arabic sheet names, CSV, wrong type/sheet/range handled     OK")
++
++
++# ---------------------------------------------------------------- step 10
++def test_8_workflows_load_with_override_and_validation():
++    wfs = w.load_workflows("u1")
++    assert set(wfs) == {"document-brief", "gazette-appointments"}, set(wfs)  # Bad_Name rejected
++    assert wfs["document-brief"][1] == "mine" and "MY brief" in wfs["document-brief"][0].description
++    assert w.load_workflows("u2")["document-brief"][1] == "shared"
++    print("8. shared + user workflows; user overrides; invalid skipped    OK")
++
++
++def test_9_prompt_block_and_tools():
++    block = w.workflows_block("u1")
++    assert "gazette-appointments (shared): List appointments." in block
++    assert "Step one" not in block  # only names + descriptions in the prompt
++    out = w.read_workflow("gazette-appointments", CTX)
++    assert "Step one for gazette-appointments" in out and "All earlier rules still apply" in out
++    assert "No workflow named 'nope'" in w.read_workflow("nope", CTX)
++    assert "document-brief (mine)" in w.list_workflows(CTX)
++    print("9. prompt shows descriptions only; read_workflow loads steps   OK")
++
++
++def test_10_user_folder_is_safe():
++    assert w._user_folder("../u1").name == "_u1"
++    assert w.load_workflows("../u1")["document-brief"][1] == "shared"  # can't read u1's
++    print("10. user workflow folders can't be escaped with ../            OK")
++
++
++if __name__ == "__main__":
++    for name, fn in sorted(globals().items(), key=lambda kv: int(kv[0].split("_")[1]) if kv[0].startswith("test_") else 0):
++        if name.startswith("test_"):
++            fn()
++    print("\nAll step-9/10 tests passed.")
+diff --git a/tool_guard.py b/tool_guard.py
+index 1a7fd4f..485335a 100644
+--- a/tool_guard.py
++++ b/tool_guard.py
+@@ -36,7 +36,8 @@ from spotlight import fence_inline, nonce_for  # STEP 6
+ 
+ AUDIT_LOG = os.getenv("AUDIT_LOG", "audit.log")
+ MAX_TOOL_RESULT_CHARS = int(os.getenv("MAX_TOOL_RESULT_CHARS", "120000"))
+-DOCUMENT_TOOLS = {"list_documents", "read_document", "find_in_document", "search_documents"}
++DOCUMENT_TOOLS = {"list_documents", "read_document", "find_in_document", "search_documents",
++                  "fetch_documents", "read_table_cells"}
+ 
+ # run_id -> set of documents already read in that run (cleared after the run)
+ _reads_by_run: Dict[str, set] = {}
+@@ -83,6 +84,25 @@ async def tool_guard(
+             return ALREADY_READ
+         reads.add(key)
+ 
++    # STEP 9: fetch_documents skips docs already read in this run, and marks
++    # the ones it reads, so a later read_document of the same doc is blocked.
++    if function_name == "fetch_documents":
++        reads = _reads_by_run.setdefault(run_context.run_id, set())
++        keep, skipped = [], []
++        for doc_id in [d.strip() for d in str(arguments.get("doc_ids", "")).split(",") if d.strip()]:
++            doc = _resolve(doc_id, run_context)
++            key = doc.rel if doc else doc_id
++            (skipped if key in reads else keep).append(doc_id)
++            reads.add(key)
++        if not keep:
++            _audit(run_context, tool=function_name, args=safe_args, blocked="already_read")
++            return ALREADY_READ
++        arguments = {**arguments, "doc_ids": ", ".join(keep)}
++        if skipped:
++            note = f"[Skipped, already read in this answer: {', '.join(skipped)}]\n"
++            result = await function_call(**arguments)
++            return note + str(result)
++
+     # Run the tool; turn crashes into errors the model can act on
+     error = None
+     try:
+@@ -139,6 +159,16 @@ def _activity_line(t, n: str) -> str:
+         return f"- read_document -> {_first_line(t.result)}"
+     if name == "find_in_document":
+         return f"- find_in_document({args.get('doc_id') or 'all'}, \"{args.get('query')}\") -> {_first_line(t.result)}"
++    if name == "fetch_documents":                                    # STEP 9: ids only
++        heads = [l for l in str(t.result).splitlines() if l.startswith("Document doc-")]
++        return f"- fetch_documents -> " + "; ".join(h[:120] for h in heads[:10])
++    if name == "read_table_cells":
++        return (f"- read_table_cells({args.get('doc_id')}, sheet={args.get('sheet') or 'first'}, "
++                f"range={args.get('cell_range') or 'top'}) -> {_first_line(t.result, 160)}")
++    if name == "read_workflow":                                      # STEP 10
++        return f"- read_workflow({args.get('name')}) -> {_first_line(t.result, 120)}"
++    if name == "list_workflows":
++        return "- list_workflows"
+     if name == "search_documents":                                   # STEP 8: ids only
+         return f"- search_documents(\"{args.get('query')}\") -> {_first_line(t.result, 200)}"
+     if name == "ask_user":                                           # user's choices
+diff --git a/workflows.py b/workflows.py
+new file mode 100644
+index 0000000..985cf3d
+--- /dev/null
++++ b/workflows.py
+@@ -0,0 +1,127 @@
++"""
++workflows.py: STEP 10, saved prompt templates ("workflows"), like Mike's.
++
++A workflow is a folder with a SKILL.md file (the Agent Skills format that Agno
++already parses and validates with agno.skills.LocalSkills):
++
++    workflows/
++      shared/                       <- for everyone (written by admins)
++        gazette-appointments/SKILL.md
++      users/<user_id>/              <- the user's own workflows
++        my-weekly-report/SKILL.md
++
++    SKILL.md:
++      ---
++      name: gazette-appointments          (lowercase, hyphens, = folder name)
++      description: One line saying WHEN to use it (shown to the model)
++      ---
++      Step-by-step instructions the agent follows...
++
++How the agent uses them
++  - AVAILABLE WORKFLOWS (name + description) is added to the system prompt.
++  - list_workflows / read_workflow tools load a workflow on demand, so long
++    instructions only cost tokens when used (progressive disclosure).
++  - The user can also run one explicitly: /wf <name> [extra text] in the CLI.
++
++Why not Agent(skills=...) directly? Agno's Skills also exposes get_skill_script,
++which can EXECUTE scripts, and it has no per-user folders. We reuse its loader
++and validator, and expose only read-only tools.
++"""
++
++import logging
++import os
++import re
++from pathlib import Path
++from typing import Dict, Optional, Tuple
++
++from agno.run import RunContext
++from agno.skills import LocalSkills, Skill
++
++log = logging.getLogger("sift.workflows")
++
++WORKFLOWS_DIR = Path(os.getenv("WORKFLOWS_DIR", "workflows"))
++MAX_WORKFLOW_CHARS = 20_000
++
++
++def _user_folder(user_id: Optional[str]) -> Path:
++    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", user_id or "anonymous").lstrip(".") or "anonymous"
++    return WORKFLOWS_DIR / "users" / safe
++
++
++def _load_folder(folder: Path) -> Dict[str, Skill]:
++    if not folder.is_dir():
++        return {}
++    out = {}
++    for item in sorted(folder.iterdir()):  # one bad workflow must not hide the others
++        if item.is_dir() and (item / "SKILL.md").exists():
++            try:
++                for skill in LocalSkills(str(item), validate=True).load():
++                    out[skill.name] = skill
++            except Exception as e:
++                log.warning("Skipping workflow %s: %s", item.name, e)
++    return out
++
++
++def load_workflows(user_id: Optional[str]) -> Dict[str, Tuple[Skill, str]]:
++    """name -> (skill, scope). The user's own workflows override shared ones
++    with the same name (only for that user)."""
++    found = {n: (s, "shared") for n, s in _load_folder(WORKFLOWS_DIR / "shared").items()}
++    found.update({n: (s, "mine") for n, s in _load_folder(_user_folder(user_id)).items()})
++    return found
++
++
++def workflows_block(user_id: Optional[str]) -> str:
++    """AVAILABLE WORKFLOWS for the system prompt: names + descriptions only."""
++    wfs = load_workflows(user_id)
++    if not wfs:
++        return ""
++    lines = ["AVAILABLE WORKFLOWS (saved step-by-step procedures):"]
++    for name, (skill, scope) in sorted(wfs.items()):
++        lines.append(f"- {name} ({scope}): {' '.join(skill.description.split())[:300]}")
++    lines.append("When the user's request matches a workflow, call read_workflow(name) "
++                 "FIRST and follow its steps. Don't follow a workflow the user didn't ask for "
++                 "if it doesn't fit the request.")
++    return "\n".join(lines)
++
++
++def get_workflow(name: str, user_id: Optional[str]) -> Optional[Tuple[Skill, str]]:
++    return load_workflows(user_id).get(name.strip().lower())
++
++
++def format_workflow(skill: Skill, scope: str) -> str:
++    body = skill.instructions.strip()[:MAX_WORKFLOW_CHARS]
++    return (f"Workflow '{skill.name}' ({scope}): {skill.description}\n\n"
++            f"--- instructions ---\n{body}\n--- end of workflow ---\n"
++            "Follow these steps using your tools. All earlier rules still apply "
++            "(grounding, citations, approvals, reply language).")
++
++
++# ---------------------------------------------------------------------------
++# Tools
++# ---------------------------------------------------------------------------
++def list_workflows(run_context: RunContext) -> str:
++    """List the saved workflows (step-by-step procedures) available to the
++    user, with a description of when to use each one.
++    """
++    wfs = load_workflows(run_context.user_id)
++    if not wfs:
++        return "No workflows are available."
++    return "\n".join(f"- {n} ({scope}): {s.description}" for n, (s, scope) in sorted(wfs.items()))
++
++
++def read_workflow(name: str, run_context: RunContext) -> str:
++    """Load the full instructions of a saved workflow, then follow them.
++    Call this when the user's request matches a workflow in AVAILABLE WORKFLOWS,
++    or when the user asks to run a workflow by name.
++
++    Args:
++        name: The workflow name, e.g. "gazette-appointments".
++    """
++    found = get_workflow(name, run_context.user_id)
++    if not found:
++        names = ", ".join(sorted(load_workflows(run_context.user_id))) or "none"
++        return f"No workflow named '{name}'. Available: {names}."
++    return format_workflow(*found)
++
++
++WORKFLOW_TOOLS = [list_workflows, read_workflow]
+diff --git a/workflows/shared/compare-documents/SKILL.md b/workflows/shared/compare-documents/SKILL.md
+new file mode 100644
+index 0000000..8ac93a7
+--- /dev/null
++++ b/workflows/shared/compare-documents/SKILL.md
+@@ -0,0 +1,22 @@
++---
++name: compare-documents
++description: Compare two or more documents side by side (differences, changes between versions, conflicting numbers or dates) as a table with citations. Use for "compare", "what changed", "difference between", "قارن", "ما الفرق".
++---
++
++# Compare documents
++
++## Steps
++
++1. Identify the documents (2-5). If unclear, ask with ask_user.
++2. Read them together with fetch_documents (small/medium files), or read
++   each with read_document. For spreadsheets use read_table_cells.
++3. Decide the comparison points from the content (e.g. parties, amounts,
++   dates, obligations, members, decisions). If the user named points, use those.
++4. Output a table: one row per point, one column per document, plus a
++   "Difference" column. Cite every cell as (doc_id, Page N).
++5. Below the table: the 3 most important differences in plain words, and
++   anything present in one document but missing in the other.
++
++## Rules
++- Only compare what the tools returned; write "not stated" when a document
++  doesn't mention a point.
+diff --git a/workflows/shared/document-brief/SKILL.md b/workflows/shared/document-brief/SKILL.md
+new file mode 100644
+index 0000000..d76dc57
+--- /dev/null
++++ b/workflows/shared/document-brief/SKILL.md
+@@ -0,0 +1,23 @@
++---
++name: document-brief
++description: A one-page structured brief of a single document (what it is, key points, decisions, dates, amounts, people, open questions) with page citations. Use for "summarise this file", "brief me on", "لخص", "ملخص".
++---
++
++# Document brief
++
++## Steps
++
++1. Pick the document from AVAILABLE DOCUMENTS (use the summaries). If it is
++   unclear which one, ask with ask_user.
++2. Read it with read_document. If it is truncated, use find_in_document /
++   search_documents for the remaining sections (decisions, amounts, dates).
++   For spreadsheets use read_table_cells instead.
++3. Write the brief with these headings (in the reply language):
++   - What it is: type, issuer, number/date (one line)
++   - Key points: 3-7 bullets
++   - Decisions / obligations: who must do what, by when
++   - Numbers and dates: amounts, deadlines, effective dates
++   - People and bodies named
++   - Open questions: anything unclear, missing or contradictory
++4. Cite each point as (doc_id, Page N). Quote exact wording for decisions.
++5. Keep it under ~400 words unless the user asks for more.
+diff --git a/workflows/shared/gazette-appointments/SKILL.md b/workflows/shared/gazette-appointments/SKILL.md
+new file mode 100644
+index 0000000..32bfac5
+--- /dev/null
++++ b/workflows/shared/gazette-appointments/SKILL.md
+@@ -0,0 +1,32 @@
++---
++name: gazette-appointments
++description: List every appointment, committee formation or membership decision in an official gazette issue as a table (decision number, person, role, body, page). Use for "who was appointed", "list the committees", "من تم تعيينه", "أعضاء اللجان".
++---
++
++# Gazette appointments and committees
++
++Goal: a complete, verified table of every decision that names people.
++
++## Steps
++
++1. Identify the gazette issue. If the user didn't name one, use the most
++   recent gazette in AVAILABLE DOCUMENTS; if several could match, ask with
++   ask_user (2-4 choices).
++2. Find the decisions. Run these searches on that document (doc_ids=...):
++   - search_documents: "تعيين", "تشكيل لجنة", "عضوية", "appointment", "committee"
++   - find_in_document: "قرار رقم" to list every decision number with its page
++3. For each decision that names a person, read enough context to get all
++   fields: find_in_document with the decision number and context_chars 600-1000.
++4. Build the table. Columns:
++   | Decision no. | Person | Role (رئيس/عضو/مقرر...) | Body / committee | Page |
++   One row per person. Copy names EXACTLY as written, with titles (السيد/،
++   الدكتور/). Never complete or correct a name.
++5. Check completeness: count the decisions you found in step 2 and say how
++   many were included and which (if any) were skipped and why.
++6. Offer next steps: save the table with save_note, or ask about one decision.
++
++## Rules
++- Every row must come from this turn's tool results (the grounding check
++  verifies names and numbers).
++- If a page is unreadable or a name is cut off, write "غير واضح / unclear"
++  instead of guessing.
+diff --git a/workflows/users/.gitkeep b/workflows/users/.gitkeep
+new file mode 100644
+index 0000000..e69de29
+-- 
+2.43.0
+
